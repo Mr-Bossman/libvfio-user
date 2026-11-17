@@ -48,8 +48,7 @@ modprobe vfio_iommu_type1
 echo 1 > /sys/module/vfio_iommu_type1/parameters/allow_unsafe_interrupts
 echo vfio-pci > /sys/bus/pci/devices/$BDF/driver_override
 echo $BDF > /sys/bus/pci/drivers_probe
-VFIO_GROUP=$(basename "$(readlink /sys/bus/pci/devices/$BDF/iommu_group)")
-exec /run/live/persistence/vda/libvfio-user/build/samples/vfio-user-proxy -v /run/vfio-user-proxy/proxy.sock $VFIO_GROUP $BDF
+exec /run/live/persistence/vda/libvfio-user/build/samples/vfio-user-proxy -v /run/vfio-user-proxy/proxy.sock $BDF
 EOF
     chmod +x /usr/local/bin/start-pci-proxy.sh
 
@@ -62,7 +61,7 @@ After=network.target
 Type=simple
 RuntimeDirectory=vfio-user-proxy
 ExecStart=/usr/local/bin/start-pci-proxy.sh $bdf
-Restart=on-success
+Restart=always
 RestartSec=1
 StandardOutput=journal+console
 StandardError=journal+console
