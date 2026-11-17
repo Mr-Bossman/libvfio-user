@@ -19,8 +19,17 @@ ISO="$SCRIPT_DIR/debian-live-testing-amd64-standard.iso"
 PERSIST_IMG="$CACHE_DIR/persistence.img"
 SSH_KEY="$CACHE_DIR/test-key"
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i $SSH_KEY"
+TMUX_SESSION="vfio-test"
 
 check_prereqs() {
+    local cmd
+    for cmd in tmux qemu-system-x86_64 ssh rsync mkfs.ext4; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            echo "Missing required command: $cmd"
+            exit 1
+        fi
+    done
+
     if [ ! -f "$ISO" ]; then
         echo "Missing $(basename "$ISO") in $SCRIPT_DIR"
         exit 1
@@ -152,22 +161,23 @@ start_l1() {
     echo "  e1000 NIC   -> passthrough target (no backend)"
     echo "  virtio-net  -> network for apt (SSH on host port 2222)"
     echo "  persistence -> autologin + guest-setup + libvfio-user source"
+    echo "  attach:       tmux attach -t $TMUX_SESSION"
     echo ""
 
-    qemu-system-x86_64 \
-        -machine q35 \
-        -smp 4 -m 4G \
-        -enable-kvm -cpu host \
-        -kernel "$tmpdir/vmlinuz" \
-        -initrd "$tmpdir/initrd.img" \
-        -cdrom "$ISO" \
-        -drive file="$PERSIST_IMG",format=raw,if=virtio \
-        -append "boot=live console=ttyS0 modprobe.blacklist=e1000 persistence intel_iommu=on" \
-        -device intel-iommu \
-        -device e1000 \
-        -nic user,model=virtio-net-pci,hostfwd=tcp::2222-:22 \
-        -nographic &
-    L1_PID=$!
+    tmux new-session -d -s "$TMUX_SESSION" -n L1 \
+        "qemu-system-x86_64 \
+            -machine q35 \
+            -smp 4 -m 4G \
+            -enable-kvm -cpu host \
+            -kernel '$tmpdir/vmlinuz' \
+            -initrd '$tmpdir/initrd.img' \
+            -cdrom '$ISO' \
+            -drive file='$PERSIST_IMG',format=raw,if=virtio \
+            -append 'boot=live console=ttyS0 modprobe.blacklist=e1000 persistence intel_iommu=on' \
+            -device intel-iommu \
+            -device e1000 \
+            -nic user,model=virtio-net-pci,hostfwd=tcp::2222-:22 \
+            -nographic"
 }
 
 wait_for_proxy() {
@@ -197,23 +207,30 @@ forward_socket() {
 start_l2() {
     local tmpdir="$1"
 
-    echo "=== Starting L2 VM (on host) ==="
-    qemu-system-x86_64 \
-        -machine q35 \
-        -m 2G -enable-kvm -cpu host \
-        -kernel "$tmpdir/vmlinuz" \
-        -initrd "$tmpdir/initrd.img" \
-        -cdrom "$ISO" \
-        -append "boot=live console=ttyS0" \
-        -device '{"driver":"vfio-user-pci","socket":{"type":"unix","path":"'"$tmpdir/proxy.sock"'"}}' \
-        -nographic
+    echo "=== Starting L2 VM (split pane in tmux session: $TMUX_SESSION) ==="
+
+    tmux split-window -h -t "$TMUX_SESSION" \
+        "qemu-system-x86_64 \
+            -machine q35 \
+            -m 2G -enable-kvm -cpu host \
+            -kernel '$tmpdir/vmlinuz' \
+            -initrd '$tmpdir/initrd.img' \
+            -cdrom '$ISO' \
+            -append 'boot=live console=ttyS0' \
+            -device '{\"driver\":\"vfio-user-pci\",\"socket\":{\"type\":\"unix\",\"path\":\"$tmpdir/proxy.sock\"}}' \
+            -nographic"
+}
+
+wait_for_session() {
+    while tmux has-session -t $TMUX_SESSION 2>/dev/null; do
+        sleep 2
+    done
 }
 
 teardown() {
     kill "$SSH_PID" 2>/dev/null
-    kill "$L1_PID" 2>/dev/null
     wait "$SSH_PID" 2>/dev/null
-    wait "$L1_PID" 2>/dev/null
+    tmux kill-session -t $TMUX_SESSION 2>/dev/null || true
     echo "=== Test complete ==="
 }
 
@@ -221,7 +238,7 @@ cleanup() {
     local tmpdir="$1"
     umount "$tmpdir/iso" "$tmpdir/persist-mnt" 2>/dev/null || true
     kill "$SSH_PID" 2>/dev/null || true
-    kill "$L1_PID" 2>/dev/null || true
+    tmux kill-session -t $TMUX_SESSION 2>/dev/null || true
     rm -rf "$tmpdir"
 }
 
@@ -233,7 +250,9 @@ extract_kernel "$TMPDIR"
 create_persistence "$TMPDIR"
 update_persistence "$TMPDIR"
 start_l1 "$TMPDIR"
+echo "=== Attach: \`tmux attach -t $TMUX_SESSION\` ==="
 wait_for_proxy
 forward_socket "$TMPDIR"
 start_l2 "$TMPDIR"
+wait_for_session
 teardown
