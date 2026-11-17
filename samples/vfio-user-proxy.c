@@ -58,9 +58,7 @@
 #include <unistd.h>
 #include <err.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <poll.h>
-#include <signal.h>
 #include <stdbool.h>
 #include <sys/ioctl.h>
 #include <sys/eventfd.h>
@@ -114,8 +112,8 @@ proxy_log(vfu_ctx_t *vfu_ctx UNUSED, UNUSED int level, char const *msg)
 }
 
 static ssize_t access_common(vfu_ctx_t *vfu_ctx, char *buf, size_t count,
-		  loff_t vfio_off, bool is_write,  uint64_t region_offset,
-		  const char* region_name)
+		  loff_t offset, bool is_write, uint64_t region_offset,
+		  const char *region_name)
 {
     struct proxy_data *p = vfu_get_private(vfu_ctx);
     uint64_t vfio_off = region_offset + offset;
@@ -132,9 +130,11 @@ static ssize_t access_common(vfu_ctx_t *vfu_ctx, char *buf, size_t count,
     }
 
     if (ret < 0) {
-	vfu_log(vfu_ctx, LOG_ERR, "%s %s %zu bytes at %#lx (vfio_off %#lx) returned %d",
+	ret = errno;
+	vfu_log(vfu_ctx, LOG_ERR, "%s %s %zu bytes at %#lx (vfio_off %#lx): %m",
 	    region_name, is_write ? "write" : "read",
-	    count, (unsigned long)offset, (unsigned long)vfio_off, (int)ret);
+	    count, (unsigned long)offset, (unsigned long)vfio_off);
+	errno = ret;
 	return -1;
     }
 
@@ -176,7 +176,7 @@ cfg_access(vfu_ctx_t *vfu_ctx, char *buf, size_t count, loff_t offset,
     struct proxy_data *p = vfu_get_private(vfu_ctx);
     uint64_t region_offset = p->pci.config_region_info.offset;
 
-    return acccess_common(vfu_ctx, buf, count, offset, is_write,
+    return access_common(vfu_ctx, buf, count, offset, is_write,
 		region_offset, "config");
 
 }
@@ -318,6 +318,11 @@ setup_bars(vfu_ctx_t *vfu_ctx)
 
         vfu_log(vfu_ctx, LOG_DEBUG, "BAR%d size=%#lx flags=%#x",
                 i, (unsigned long)p->pci.bar_region_info[i].size, flags);
+
+        /* 64-bit BARs span two consecutive indices; skip the upper half. */
+        if (flags & VFU_REGION_FLAG_64_BITS) {
+            i++;
+        }
     }
 }
 
@@ -372,9 +377,12 @@ proxy_run(vfu_ctx_t *vfu_ctx)
                 vfu_log(vfu_ctx, LOG_DEBUG,
                         "forwarding INTx (count=%lu)",
                         (unsigned long)val);
-                vfu_irq_trigger(vfu_ctx, 0);
+                if (vfu_irq_trigger(vfu_ctx, 0) < 0) {
+                    vfu_log(vfu_ctx, LOG_ERR, "vfu_irq_trigger: %m");
+                    return -1;
+                }
             }
-	    if (cnt < 0) {
+	    if (cnt < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
 		vfu_log(vfu_ctx, LOG_ERR, "read INTx eventfd: %m");
 		return -1;
 	    }
@@ -409,7 +417,7 @@ static void setup_rom_region(struct proxy_data *p) {
 
     if (ioctl(p->pci.dev.fd, VFIO_DEVICE_GET_REGION_INFO,
               &p->rom_region) < 0) {
-        vfu_log(vfu_ctx, LOG_DEBUG, "ROM region not available: %m");
+        vfu_log(p->vfu_ctx, LOG_DEBUG, "ROM region not available: %m");
         memset(&p->rom_region, 0, sizeof(p->rom_region));
     }
 }
@@ -534,6 +542,9 @@ main(int argc, char *argv[])
     struct proxy_data proxy = {
         .intx_eventfd = -1,
         .log_level = LOG_ERR,
+        .fds = {
+            [POLL_INTX] = { .fd = -1 },
+        },
     };
 
     opts = parse_args(argc, argv);
@@ -543,9 +554,7 @@ main(int argc, char *argv[])
                              LIBVFIO_USER_FLAG_ATTACH_NB, &proxy,
                              VFU_DEV_TYPE_PCI);
     if (vfu_ctx == NULL) {
-        warn("vfu_create_ctx");
-        ret = -1;
-        goto cleanup_vfu;
+        err(EXIT_FAILURE, "vfu_create_ctx");
     }
 
     proxy.vfu_ctx = vfu_ctx;
