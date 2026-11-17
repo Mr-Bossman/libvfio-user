@@ -86,6 +86,7 @@ struct proxy_data {
 
     int intx_eventfd;
     vfu_ctx_t *vfu_ctx;
+    struct pollfd fds[POLL_NR];
 };
 
 static const char *
@@ -112,17 +113,6 @@ proxy_log(vfu_ctx_t *vfu_ctx UNUSED, UNUSED int level, char const *msg)
     fprintf(stderr, "proxy[%s]: %s\n", log_level_str(level), msg);
 }
 
-static ssize_t pread_write(size_t count;
-                           int fd, void buf[count], size_t count,
-                           off_t offset, bool is_write) {
-	if (is_write) {
-		return pwrite(fd, buf, count, offset);
-	} else {
-		return pread(fd, buf, count, offset);
-	}
-
-}
-
 static ssize_t access_common(vfu_ctx_t *vfu_ctx, char *buf, size_t count,
 		  loff_t vfio_off, bool is_write,  uint64_t region_offset,
 		  const char* region_name)
@@ -135,7 +125,11 @@ static ssize_t access_common(vfu_ctx_t *vfu_ctx, char *buf, size_t count,
 	    region_name, is_write ? "write" : "read",
 	    count, (unsigned long)offset, (unsigned long)vfio_off);
 
-    ret = pread_write(count, p->pci.dev.fd, buf, count, vfio_off, is_write);
+    if (is_write) {
+        ret = pwrite(p->pci.dev.fd, buf, count, vfio_off);
+    } else {
+        ret = pread(p->pci.dev.fd, buf, count, vfio_off);
+    }
 
     if (ret < 0) {
 	vfu_log(vfu_ctx, LOG_ERR, "%s %s %zu bytes at %#lx (vfio_off %#lx) returned %d",
@@ -267,6 +261,9 @@ setup_intx(vfu_ctx_t *vfu_ctx)
 
     vfu_log(vfu_ctx, LOG_DEBUG, "INTx eventfd armed");
 
+    p->fds[POLL_INTX].fd = p->intx_eventfd;
+    p->fds[POLL_INTX].events = POLLIN;
+
     return 0;
 }
 
@@ -355,17 +352,12 @@ static int
 proxy_run(vfu_ctx_t *vfu_ctx)
 {
     struct proxy_data *p = vfu_get_private(vfu_ctx);
-    struct pollfd fds[POLL_NR];
+    uint64_t val;
+    ssize_t cnt;
     int ret;
 
-    fds[POLL_VFU].fd = vfu_get_poll_fd(vfu_ctx);
-    fds[POLL_VFU].events = POLLIN;
-
-    fds[POLL_INTX].fd = p->intx_eventfd;
-    fds[POLL_INTX].events = (p->intx_eventfd >= 0) ? POLLIN : 0;
-
     for (;;) {
-        ret = poll(fds, POLL_NR, -1);
+        ret = poll(p->fds, POLL_NR, -1);
         if (ret < 0) {
             if (errno == EINTR) {
                 continue;
@@ -374,18 +366,21 @@ proxy_run(vfu_ctx_t *vfu_ctx)
             return -1;
         }
 
-        if (fds[POLL_INTX].revents & POLLIN) {
-            uint64_t val;
-            ssize_t n = read(p->intx_eventfd, &val, sizeof(val));
-            if (n == (ssize_t)sizeof(val)) {
+        if (p->fds[POLL_INTX].revents & POLLIN) {
+            cnt = read(p->intx_eventfd, &val, sizeof(val));
+            if (cnt == (ssize_t)sizeof(val)) {
                 vfu_log(vfu_ctx, LOG_DEBUG,
                         "forwarding INTx (count=%lu)",
                         (unsigned long)val);
                 vfu_irq_trigger(vfu_ctx, 0);
             }
+	    if (cnt < 0) {
+		vfu_log(vfu_ctx, LOG_ERR, "read INTx eventfd: %m");
+		return -1;
+	    }
         }
 
-        if (fds[POLL_VFU].revents & POLLIN) {
+        if (p->fds[POLL_VFU].revents & POLLIN) {
             ret = vfu_run_ctx(vfu_ctx);
             if (ret < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -400,7 +395,7 @@ proxy_run(vfu_ctx_t *vfu_ctx)
             }
         }
 
-        if (fds[POLL_VFU].revents & (POLLHUP | POLLERR)) {
+        if (p->fds[POLL_VFU].revents & (POLLHUP | POLLERR)) {
             vfu_log(vfu_ctx, LOG_INFO, "poll fd error/hangup");
             return 0;
         }
@@ -479,6 +474,9 @@ setup_device(vfu_ctx_t *vfu_ctx)
         return -1;
     }
     vfu_log(vfu_ctx, LOG_INFO, "client connected");
+
+    p->fds[POLL_VFU].fd = vfu_get_poll_fd(vfu_ctx);
+    p->fds[POLL_VFU].events = POLLIN;
 
     return 0;
 }
