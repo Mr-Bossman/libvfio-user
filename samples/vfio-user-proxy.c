@@ -193,7 +193,8 @@ irq_thread_fn(void *arg)
                 continue;
             break;
         }
-        vfu_irq_trigger(p->vfu_ctx, 0);
+        if (p->irq_thread_running)
+            vfu_irq_trigger(p->vfu_ctx, 0);
     }
 
     return NULL;
@@ -479,8 +480,10 @@ usage:
 
     proxy.irq_thread_running = false;
     if (proxy.intx_eventfd >= 0) {
-        close(proxy.intx_eventfd);
+        uint64_t kick = 1;
+        write(proxy.intx_eventfd, &kick, sizeof(kick));
         pthread_join(proxy.irq_thread, NULL);
+        close(proxy.intx_eventfd);
     }
 
     vfu_destroy_ctx(vfu_ctx);
