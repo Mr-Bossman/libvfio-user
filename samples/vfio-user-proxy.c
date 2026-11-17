@@ -59,7 +59,6 @@
 #include <err.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <libgen.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -67,22 +66,17 @@
 #include <sys/eventfd.h>
 #include <linux/vfio.h>
 
+#include <vfn/vfio.h>
+#include <vfn/pci.h>
+
 #include "common.h"
 #include "libvfio-user.h"
 #include "pci_defs.h"
 
 struct proxy_data {
-    int container_fd;
-    int group_fd;
-    int device_fd;
-    bool supports_reset;
+    struct vfio_pci_device pci;
+    struct vfio_region_info rom_region;
     int log_level;
-
-    struct {
-        uint64_t size;
-        uint64_t offset;
-        uint32_t flags;
-    } regions[VFIO_PCI_NUM_REGIONS];
 
     int intx_eventfd;
     pthread_t irq_thread;
@@ -119,7 +113,7 @@ bar_access_common(vfu_ctx_t *vfu_ctx, int bar_idx, char *buf, size_t count,
                   loff_t offset, bool is_write)
 {
     struct proxy_data *p = vfu_get_private(vfu_ctx);
-    uint64_t vfio_off = p->regions[bar_idx].offset + offset;
+    uint64_t vfio_off = p->pci.bar_region_info[bar_idx].offset + offset;
     ssize_t ret;
 
     vfu_log(vfu_ctx, LOG_DEBUG, "BAR%d %s %zu bytes at %#lx (vfio_off %#lx)",
@@ -127,9 +121,9 @@ bar_access_common(vfu_ctx_t *vfu_ctx, int bar_idx, char *buf, size_t count,
             count, (unsigned long)offset, (unsigned long)vfio_off);
 
     if (is_write) {
-        ret = pwrite(p->device_fd, buf, count, vfio_off);
+        ret = pwrite(p->pci.dev.fd, buf, count, vfio_off);
     } else {
-        ret = pread(p->device_fd, buf, count, vfio_off);
+        ret = pread(p->pci.dev.fd, buf, count, vfio_off);
     }
 
     if (ret < 0) {
@@ -170,18 +164,16 @@ cfg_access(vfu_ctx_t *vfu_ctx, char *buf, size_t count, loff_t offset,
            bool is_write)
 {
     struct proxy_data *p = vfu_get_private(vfu_ctx);
-    uint64_t vfio_off = p->regions[VFIO_PCI_CONFIG_REGION_INDEX].offset +
-                         offset;
     ssize_t ret;
 
-    vfu_log(vfu_ctx, LOG_DEBUG, "config %s %zu bytes at %#lx (vfio_off %#lx)",
+    vfu_log(vfu_ctx, LOG_DEBUG, "config %s %zu bytes at %#lx",
             is_write ? "write" : "read",
-            count, (unsigned long)offset, (unsigned long)vfio_off);
+            count, (unsigned long)offset);
 
     if (is_write) {
-        ret = pwrite(p->device_fd, buf, count, vfio_off);
+        ret = vfio_pci_write_config(&p->pci, buf, count, offset);
     } else {
-        ret = pread(p->device_fd, buf, count, vfio_off);
+        ret = vfio_pci_read_config(&p->pci, buf, count, offset);
     }
 
     if (ret < 0) {
@@ -202,7 +194,7 @@ rom_access(vfu_ctx_t *vfu_ctx, char *buf, size_t count, loff_t offset,
            bool is_write)
 {
     struct proxy_data *p = vfu_get_private(vfu_ctx);
-    uint64_t vfio_off = p->regions[VFIO_PCI_ROM_REGION_INDEX].offset + offset;
+    uint64_t vfio_off = p->rom_region.offset + offset;
     ssize_t ret;
 
     if (is_write) {
@@ -215,7 +207,7 @@ rom_access(vfu_ctx_t *vfu_ctx, char *buf, size_t count, loff_t offset,
     vfu_log(vfu_ctx, LOG_DEBUG, "ROM read %zu bytes at %#lx (vfio_off %#lx)",
             count, (unsigned long)offset, (unsigned long)vfio_off);
 
-    ret = pread(p->device_fd, buf, count, vfio_off);
+    ret = pread(p->pci.dev.fd, buf, count, vfio_off);
     if (ret < 0) {
         vfu_log(vfu_ctx, LOG_ERR, "ROM read at %#lx+%zu: %m",
                 (unsigned long)offset, count);
@@ -263,141 +255,22 @@ static int
 device_reset(vfu_ctx_t *vfu_ctx, vfu_reset_type_t type)
 {
     struct proxy_data *p = vfu_get_private(vfu_ctx);
+    int ret;
 
     vfu_log(vfu_ctx, LOG_INFO, "device reset requested (type=%d)", type);
 
-    if (!p->supports_reset) {
-        vfu_log(vfu_ctx, LOG_WARNING, "device does not support reset, ignoring");
-        return 0;
-    }
-
-    if (ioctl(p->device_fd, VFIO_DEVICE_RESET) < 0) {
-        vfu_log(vfu_ctx, LOG_ERR, "VFIO_DEVICE_RESET: %m");
+    ret = vfio_reset(&p->pci.dev);
+    if (ret < 0) {
+        if (errno == ENOTSUP) {
+            vfu_log(vfu_ctx, LOG_WARNING,
+                    "device does not support reset, ignoring");
+            return 0;
+        }
+        vfu_log(vfu_ctx, LOG_ERR, "vfio_reset: %m");
         return -1;
     }
 
     vfu_log(vfu_ctx, LOG_INFO, "device reset successful");
-    return 0;
-}
-
-static int
-setup_vfio(struct proxy_data *p, int group_num, const char *bdf)
-{
-    vfu_ctx_t *vfu_ctx = p->vfu_ctx;
-    char path[64];
-    struct vfio_group_status gs = { .argsz = sizeof(gs) };
-    struct vfio_device_info di = { .argsz = sizeof(di) };
-    struct vfio_region_info ri;
-    uint32_t i;
-
-    vfu_log(vfu_ctx, LOG_DEBUG, "opening VFIO container /dev/vfio/vfio");
-
-    p->container_fd = open("/dev/vfio/vfio", O_RDWR);
-    if (p->container_fd < 0) {
-        vfu_log(vfu_ctx, LOG_ERR, "/dev/vfio/vfio: %m");
-        return -1;
-    }
-
-    vfu_log(vfu_ctx, LOG_DEBUG, "container fd=%d", p->container_fd);
-
-    if (ioctl(p->container_fd, VFIO_GET_API_VERSION) != VFIO_API_VERSION) {
-        vfu_log(vfu_ctx, LOG_ERR, "VFIO API version mismatch");
-        return -1;
-    }
-
-    vfu_log(vfu_ctx, LOG_DEBUG, "VFIO API version OK");
-
-    snprintf(path, sizeof(path), "/dev/vfio/%d", group_num);
-    p->group_fd = open(path, O_RDWR);
-    if (p->group_fd < 0) {
-        vfu_log(vfu_ctx, LOG_DEBUG, "%s not found, trying noiommu-%d",
-                path, group_num);
-        snprintf(path, sizeof(path), "/dev/vfio/noiommu-%d", group_num);
-        p->group_fd = open(path, O_RDWR);
-        if (p->group_fd < 0) {
-            vfu_log(vfu_ctx, LOG_ERR, "VFIO group %d: %m", group_num);
-            return -1;
-        }
-    }
-
-    vfu_log(vfu_ctx, LOG_DEBUG, "opened group %s fd=%d", path, p->group_fd);
-
-    if (ioctl(p->group_fd, VFIO_GROUP_GET_STATUS, &gs) < 0) {
-        vfu_log(vfu_ctx, LOG_ERR, "VFIO_GROUP_GET_STATUS: %m");
-        return -1;
-    }
-
-    vfu_log(vfu_ctx, LOG_DEBUG, "group status flags=%#x", gs.flags);
-
-    if (!(gs.flags & VFIO_GROUP_FLAGS_VIABLE)) {
-        vfu_log(vfu_ctx, LOG_ERR,
-                "VFIO group not viable (all devices bound to vfio-pci?)");
-        return -1;
-    }
-
-    if (ioctl(p->group_fd, VFIO_GROUP_SET_CONTAINER, &p->container_fd) < 0) {
-        vfu_log(vfu_ctx, LOG_ERR, "VFIO_GROUP_SET_CONTAINER: %m");
-        return -1;
-    }
-
-    vfu_log(vfu_ctx, LOG_DEBUG, "group attached to container");
-
-    if (ioctl(p->container_fd, VFIO_SET_IOMMU, VFIO_TYPE1v2_IOMMU) == 0) {
-        vfu_log(vfu_ctx, LOG_INFO, "IOMMU set to TYPE1v2");
-    } else if (ioctl(p->container_fd, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU) == 0) {
-        vfu_log(vfu_ctx, LOG_INFO, "IOMMU set to TYPE1");
-    } else if (ioctl(p->container_fd, VFIO_SET_IOMMU, VFIO_NOIOMMU_IOMMU) == 0) {
-        vfu_log(vfu_ctx, LOG_INFO, "IOMMU set to NOIOMMU");
-    } else {
-        vfu_log(vfu_ctx, LOG_ERR, "VFIO_SET_IOMMU: %m");
-        return -1;
-    }
-
-    p->device_fd = ioctl(p->group_fd, VFIO_GROUP_GET_DEVICE_FD, bdf);
-    if (p->device_fd < 0) {
-        vfu_log(vfu_ctx, LOG_ERR, "VFIO_GROUP_GET_DEVICE_FD(%s): %m", bdf);
-        return -1;
-    }
-
-    vfu_log(vfu_ctx, LOG_DEBUG, "device %s fd=%d", bdf, p->device_fd);
-
-    if (ioctl(p->device_fd, VFIO_DEVICE_GET_INFO, &di) < 0) {
-        vfu_log(vfu_ctx, LOG_ERR, "VFIO_DEVICE_GET_INFO: %m");
-        return -1;
-    }
-
-    vfu_log(vfu_ctx, LOG_DEBUG,
-            "device info: flags=%#x num_regions=%u num_irqs=%u",
-            di.flags, di.num_regions, di.num_irqs);
-
-    if (!(di.flags & VFIO_DEVICE_FLAGS_PCI)) {
-        vfu_log(vfu_ctx, LOG_ERR, "%s is not a PCI device", bdf);
-        return -1;
-    }
-
-    p->supports_reset = !!(di.flags & VFIO_DEVICE_FLAGS_RESET);
-    vfu_log(vfu_ctx, LOG_DEBUG, "device supports reset: %s",
-            p->supports_reset ? "yes" : "no");
-
-    for (i = 0; i < di.num_regions && i < VFIO_PCI_NUM_REGIONS; i++) {
-        memset(&ri, 0, sizeof(ri));
-        ri.argsz = sizeof(ri);
-        ri.index = i;
-        if (ioctl(p->device_fd, VFIO_DEVICE_GET_REGION_INFO, &ri) == 0) {
-            p->regions[i].size = ri.size;
-            p->regions[i].offset = ri.offset;
-            p->regions[i].flags = ri.flags;
-            if (ri.size > 0) {
-                vfu_log(vfu_ctx, LOG_DEBUG,
-                        "region %u: size=%#lx offset=%#lx flags=%#x",
-                        i, (unsigned long)ri.size, (unsigned long)ri.offset,
-                        ri.flags);
-            }
-        } else {
-            vfu_log(vfu_ctx, LOG_WARNING, "region %u: get info failed: %m", i);
-        }
-    }
-
     return 0;
 }
 
@@ -409,12 +282,8 @@ setup_intx(vfu_ctx_t *vfu_ctx)
         .argsz = sizeof(irq),
         .index = VFIO_PCI_INTX_IRQ_INDEX,
     };
-    struct {
-        struct vfio_irq_set hdr;
-        int32_t fd;
-    } irq_set;
 
-    if (ioctl(p->device_fd, VFIO_DEVICE_GET_IRQ_INFO, &irq) < 0) {
+    if (ioctl(p->pci.dev.fd, VFIO_DEVICE_GET_IRQ_INFO, &irq) < 0) {
         vfu_log(vfu_ctx, LOG_INFO, "INTx IRQ info query failed: %m");
         return -1;
     }
@@ -435,17 +304,9 @@ setup_intx(vfu_ctx_t *vfu_ctx)
 
     vfu_log(vfu_ctx, LOG_DEBUG, "INTx eventfd=%d", p->intx_eventfd);
 
-    memset(&irq_set, 0, sizeof(irq_set));
-    irq_set.hdr.argsz = sizeof(irq_set);
-    irq_set.hdr.flags = VFIO_IRQ_SET_DATA_EVENTFD |
-                         VFIO_IRQ_SET_ACTION_TRIGGER;
-    irq_set.hdr.index = VFIO_PCI_INTX_IRQ_INDEX;
-    irq_set.hdr.start = 0;
-    irq_set.hdr.count = 1;
-    irq_set.fd = p->intx_eventfd;
-
-    if (ioctl(p->device_fd, VFIO_DEVICE_SET_IRQS, &irq_set) < 0) {
-        vfu_log(vfu_ctx, LOG_ERR, "VFIO_DEVICE_SET_IRQS failed: %m");
+    p->pci.dev.irq_info = irq;
+    if (vfio_set_irq(&p->pci.dev, &p->intx_eventfd, 0, 1) < 0) {
+        vfu_log(vfu_ctx, LOG_ERR, "vfio_set_irq failed: %m");
         close(p->intx_eventfd);
         p->intx_eventfd = -1;
         return -1;
@@ -460,19 +321,18 @@ static void
 setup_bars(vfu_ctx_t *vfu_ctx)
 {
     struct proxy_data *p = vfu_get_private(vfu_ctx);
-    uint64_t cfg_off = p->regions[VFIO_PCI_CONFIG_REGION_INDEX].offset;
     int ret, flags, i;
     uint32_t bar_val;
 
     for (i = 0; i < PCI_BARS_NR; i++) {
-        if (p->regions[i].size == 0) {
+        if (p->pci.bar_region_info[i].size == 0) {
             vfu_log(vfu_ctx, LOG_DEBUG, "BAR%d is zero size.", i);
             continue;
         }
         flags = VFU_REGION_FLAG_RW;
 
-        if (pread(p->device_fd, &bar_val, 4,
-                  cfg_off + PCI_BASE_ADDRESS_0 + i * 4) != 4) {
+        if (vfio_pci_read_config(&p->pci, &bar_val, 4,
+                                 PCI_BASE_ADDRESS_0 + i * 4) != 4) {
             vfu_log(vfu_ctx, LOG_ERR, "failed to read BAR%d config: %m", i);
             continue;
         }
@@ -491,15 +351,15 @@ setup_bars(vfu_ctx_t *vfu_ctx)
         }
 
         ret = vfu_setup_region(vfu_ctx, VFU_PCI_DEV_BAR0_REGION_IDX + i,
-                               p->regions[i].size, bar_cbs[i], flags,
-                               NULL, 0, -1, 0);
+                               p->pci.bar_region_info[i].size, bar_cbs[i],
+                               flags, NULL, 0, -1, 0);
         if (ret < 0) {
             vfu_log(vfu_ctx, LOG_ERR, "failed to setup BAR%d: %m", i);
             continue;
         }
 
         vfu_log(vfu_ctx, LOG_DEBUG, "BAR%d size=%#lx flags=%#x",
-                i, (unsigned long)p->regions[i].size, flags);
+                i, (unsigned long)p->pci.bar_region_info[i].size, flags);
     }
 }
 
@@ -507,15 +367,14 @@ static int
 setup_pci_id(vfu_ctx_t *vfu_ctx)
 {
     struct proxy_data *p = vfu_get_private(vfu_ctx);
-    uint64_t cfg_off = p->regions[VFIO_PCI_CONFIG_REGION_INDEX].offset;
     uint16_t vendor_id, device_id, subsys_vid, subsys_id;
     uint8_t class_info[3];
 
-    if (pread(p->device_fd, &vendor_id, 2, cfg_off + PCI_VENDOR_ID) != 2 ||
-        pread(p->device_fd, &device_id, 2, cfg_off + PCI_DEVICE_ID) != 2 ||
-        pread(p->device_fd, &subsys_vid, 2, cfg_off + PCI_SUBSYSTEM_VENDOR_ID) != 2 ||
-        pread(p->device_fd, &subsys_id, 2, cfg_off + PCI_SUBSYSTEM_ID) != 2 ||
-        pread(p->device_fd, class_info, 3, cfg_off + PCI_CLASS_PROG) != 3) {
+    if (vfio_pci_read_config(&p->pci, &vendor_id, 2, PCI_VENDOR_ID) != 2 ||
+        vfio_pci_read_config(&p->pci, &device_id, 2, PCI_DEVICE_ID) != 2 ||
+        vfio_pci_read_config(&p->pci, &subsys_vid, 2, PCI_SUBSYSTEM_VENDOR_ID) != 2 ||
+        vfio_pci_read_config(&p->pci, &subsys_id, 2, PCI_SUBSYSTEM_ID) != 2 ||
+        vfio_pci_read_config(&p->pci, class_info, 3, PCI_CLASS_PROG) != 3) {
         vfu_log(vfu_ctx, LOG_ERR, "failed to read PCI config identity fields");
         return -1;
     }
@@ -559,9 +418,9 @@ setup_device(vfu_ctx_t *vfu_ctx)
     struct proxy_data *p = vfu_get_private(vfu_ctx);
     int ret;
 
-    if (p->regions[VFIO_PCI_ROM_REGION_INDEX].size > 0) {
+    if (p->rom_region.size > 0) {
         ret = vfu_setup_region(vfu_ctx, VFU_PCI_DEV_ROM_REGION_IDX,
-                               p->regions[VFIO_PCI_ROM_REGION_INDEX].size,
+                               p->rom_region.size,
                                &rom_access, VFU_REGION_FLAG_READ,
                                NULL, 0, -1, 0);
         if (ret < 0) {
@@ -615,24 +474,6 @@ setup_device(vfu_ctx_t *vfu_ctx)
     return 0;
 }
 
-static int
-get_iommu_group(const char *bdf)
-{
-    char path[PATH_MAX];
-    char target[PATH_MAX];
-    ssize_t len;
-
-    snprintf(path, sizeof(path),
-             "/sys/bus/pci/devices/%s/iommu_group", bdf);
-    len = readlink(path, target, sizeof(target) - 1);
-    if (len < 0 || len >= (ssize_t)(sizeof(target) - 1)) {
-        err(EXIT_FAILURE, "readlink %s", path);
-    }
-
-    target[len] = '\0';
-    return atoi(basename(target));
-}
-
 struct proxy_opts {
     const char *sock_path;
     const char *bdf;
@@ -682,18 +523,13 @@ main(int argc, char *argv[])
 {
     int ret = -1;
     struct proxy_opts opts;
-    int group_num;
     vfu_ctx_t *vfu_ctx;
     struct proxy_data proxy = {
-        .container_fd = -1,
-        .group_fd = -1,
-        .device_fd = -1,
         .intx_eventfd = -1,
         .log_level = LOG_ERR,
     };
 
     opts = parse_args(argc, argv);
-    group_num = get_iommu_group(opts.bdf);
     proxy.log_level = opts.log_level;
 
     vfu_ctx = vfu_create_ctx(VFU_TRANS_SOCK, opts.sock_path, 0, &proxy,
@@ -714,15 +550,23 @@ main(int argc, char *argv[])
 
     vfu_log(vfu_ctx, LOG_DEBUG, "creating vfu context on %s", opts.sock_path);
 
-    ret = setup_vfio(&proxy, group_num, opts.bdf);
+    ret = vfio_pci_open(&proxy.pci, opts.bdf);
     if (ret < 0) {
+        vfu_log(vfu_ctx, LOG_ERR, "vfio_pci_open(%s): %m", opts.bdf);
         goto cleanup;
     }
 
-    if (proxy.regions[VFIO_PCI_CONFIG_REGION_INDEX].size == 0) {
-        vfu_log(vfu_ctx, LOG_ERR, "%s: no config region", opts.bdf);
-        ret = -1;
-        goto cleanup;
+    vfu_log(vfu_ctx, LOG_DEBUG, "device %s opened via libvfn (fd=%d)",
+            opts.bdf, proxy.pci.dev.fd);
+
+    proxy.rom_region = (struct vfio_region_info) {
+        .argsz = sizeof(proxy.rom_region),
+        .index = VFIO_PCI_ROM_REGION_INDEX,
+    };
+    if (ioctl(proxy.pci.dev.fd, VFIO_DEVICE_GET_REGION_INFO,
+              &proxy.rom_region) < 0) {
+        vfu_log(vfu_ctx, LOG_DEBUG, "ROM region not available: %m");
+        memset(&proxy.rom_region, 0, sizeof(proxy.rom_region));
     }
 
     ret = vfu_pci_init(vfu_ctx, VFU_PCI_TYPE_CONVENTIONAL,
@@ -748,7 +592,7 @@ main(int argc, char *argv[])
         vfu_log(vfu_ctx, LOG_DEBUG, "starting IRQ forwarding thread");
         proxy.irq_thread_running = true;
         /*
-         * Use a separate thread instead of of the the non-blocking mode
+         * Use a separate thread instead of the non-blocking mode
          * simply because it does the job and we don't (currently) need the extra complexity.
          */
         ret = pthread_create(&proxy.irq_thread, NULL, irq_thread_fn, &proxy);
@@ -781,9 +625,9 @@ cleanup:
         vfu_log(vfu_ctx, LOG_DEBUG, "cleaning up");
         vfu_destroy_ctx(vfu_ctx);
     }
-    close_safely(&proxy.device_fd);
-    close_safely(&proxy.group_fd);
-    close_safely(&proxy.container_fd);
+    if (proxy.pci.bdf != NULL) {
+        vfio_pci_close(&proxy.pci);
+    }
 
     return ret == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
