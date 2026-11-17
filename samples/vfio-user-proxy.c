@@ -59,7 +59,7 @@
 #include <err.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <pthread.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <sys/ioctl.h>
@@ -73,14 +73,18 @@
 #include "libvfio-user.h"
 #include "pci_defs.h"
 
+enum {
+    POLL_VFU = 0,
+    POLL_INTX,
+    POLL_NR,
+};
+
 struct proxy_data {
     struct vfio_pci_device pci;
     struct vfio_region_info rom_region;
     int log_level;
 
     int intx_eventfd;
-    pthread_t irq_thread;
-    bool irq_thread_running;
     vfu_ctx_t *vfu_ctx;
 };
 
@@ -200,38 +204,6 @@ rom_access(vfu_ctx_t *vfu_ctx, char *buf, size_t count, loff_t offset,
     return access_common(vfu_ctx, buf, count, offset, false, region_offset, "ROM");
 }
 
-static void *
-irq_thread_fn(void *arg)
-{
-    struct proxy_data *p = arg;
-    uint64_t val;
-    ssize_t ret;
-
-    vfu_log(p->vfu_ctx, LOG_DEBUG, "IRQ thread started (eventfd=%d)",
-            p->intx_eventfd);
-
-    while (p->irq_thread_running) {
-        ret = read(p->intx_eventfd, &val, sizeof(val));
-        if (ret != (ssize_t)sizeof(val)) {
-            if (errno == EINTR) {
-                vfu_log(p->vfu_ctx, LOG_DEBUG,
-                        "IRQ thread: eventfd read interrupted, retrying");
-                continue;
-            }
-            vfu_log(p->vfu_ctx, LOG_ERR,
-                    "IRQ thread: eventfd read failed (%zd): %m", ret);
-            break;
-        }
-        vfu_log(p->vfu_ctx, LOG_DEBUG,
-                "IRQ thread: forwarding INTx (count=%lu)",
-                (unsigned long)val);
-        vfu_irq_trigger(p->vfu_ctx, 0);
-    }
-
-    vfu_log(p->vfu_ctx, LOG_DEBUG, "IRQ thread exiting");
-    return NULL;
-}
-
 static int
 device_reset(vfu_ctx_t *vfu_ctx, vfu_reset_type_t type)
 {
@@ -277,7 +249,7 @@ setup_intx(vfu_ctx_t *vfu_ctx)
     vfu_log(vfu_ctx, LOG_DEBUG, "INTx info: count=%u flags=%#x",
             irq.count, irq.flags);
 
-    p->intx_eventfd = eventfd(0, EFD_CLOEXEC);
+    p->intx_eventfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (p->intx_eventfd < 0) {
         vfu_log(vfu_ctx, LOG_ERR, "eventfd creation failed: %m");
         return -1;
@@ -382,23 +354,69 @@ setup_pci_id(vfu_ctx_t *vfu_ctx)
 static int
 proxy_run(vfu_ctx_t *vfu_ctx)
 {
+    struct proxy_data *p = vfu_get_private(vfu_ctx);
+    struct pollfd fds[POLL_NR];
     int ret;
 
-    do {
-        ret = vfu_run_ctx(vfu_ctx);
-        if (ret == -1 && errno == EINTR) {
-            vfu_log(vfu_ctx, LOG_DEBUG, "vfu_run_ctx interrupted, retrying");
-            ret = 0;
-        } else if (ret == -1 && errno == ENOTCONN) {
-            vfu_log(vfu_ctx, LOG_INFO, "client disconnected");
-            ret = 0;
-            break;
-        } else if (ret == -1) {
-            vfu_log(vfu_ctx, LOG_ERR, "vfu_run_ctx returned error: %m");
-        }
-    } while (ret == 0);
+    fds[POLL_VFU].fd = vfu_get_poll_fd(vfu_ctx);
+    fds[POLL_VFU].events = POLLIN;
 
-    return ret;
+    fds[POLL_INTX].fd = p->intx_eventfd;
+    fds[POLL_INTX].events = (p->intx_eventfd >= 0) ? POLLIN : 0;
+
+    for (;;) {
+        ret = poll(fds, POLL_NR, -1);
+        if (ret < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            vfu_log(vfu_ctx, LOG_ERR, "poll: %m");
+            return -1;
+        }
+
+        if (fds[POLL_INTX].revents & POLLIN) {
+            uint64_t val;
+            ssize_t n = read(p->intx_eventfd, &val, sizeof(val));
+            if (n == (ssize_t)sizeof(val)) {
+                vfu_log(vfu_ctx, LOG_DEBUG,
+                        "forwarding INTx (count=%lu)",
+                        (unsigned long)val);
+                vfu_irq_trigger(vfu_ctx, 0);
+            }
+        }
+
+        if (fds[POLL_VFU].revents & POLLIN) {
+            ret = vfu_run_ctx(vfu_ctx);
+            if (ret < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    continue;
+                }
+                if (errno == ENOTCONN) {
+                    vfu_log(vfu_ctx, LOG_INFO, "client disconnected");
+                    return 0;
+                }
+                vfu_log(vfu_ctx, LOG_ERR, "vfu_run_ctx: %m");
+                return -1;
+            }
+        }
+
+        if (fds[POLL_VFU].revents & (POLLHUP | POLLERR)) {
+            vfu_log(vfu_ctx, LOG_INFO, "poll fd error/hangup");
+            return 0;
+        }
+    }
+}
+
+static void setup_rom_region(struct proxy_data *p) {
+    memset(&p->rom_region, 0, sizeof(p->rom_region));
+    p->rom_region.argsz = sizeof(p->rom_region);
+    p->rom_region.index = VFIO_PCI_ROM_REGION_INDEX;
+
+    if (ioctl(p->pci.dev.fd, VFIO_DEVICE_GET_REGION_INFO,
+              &p->rom_region) < 0) {
+        vfu_log(vfu_ctx, LOG_DEBUG, "ROM region not available: %m");
+        memset(&p->rom_region, 0, sizeof(p->rom_region));
+    }
 }
 
 static int
@@ -406,6 +424,8 @@ setup_device(vfu_ctx_t *vfu_ctx)
 {
     struct proxy_data *p = vfu_get_private(vfu_ctx);
     int ret;
+
+    setup_rom_region(p);
 
     if (p->rom_region.size > 0) {
         ret = vfu_setup_region(vfu_ctx, VFU_PCI_DEV_ROM_REGION_IDX,
@@ -521,12 +541,13 @@ main(int argc, char *argv[])
     opts = parse_args(argc, argv);
     proxy.log_level = opts.log_level;
 
-    vfu_ctx = vfu_create_ctx(VFU_TRANS_SOCK, opts.sock_path, 0, &proxy,
+    vfu_ctx = vfu_create_ctx(VFU_TRANS_SOCK, opts.sock_path,
+                             LIBVFIO_USER_FLAG_ATTACH_NB, &proxy,
                              VFU_DEV_TYPE_PCI);
     if (vfu_ctx == NULL) {
         warn("vfu_create_ctx");
         ret = -1;
-        goto cleanup;
+        goto cleanup_vfu;
     }
 
     proxy.vfu_ctx = vfu_ctx;
@@ -534,7 +555,7 @@ main(int argc, char *argv[])
     ret = vfu_setup_log(vfu_ctx, proxy_log, proxy.log_level);
     if (ret < 0) {
         warn("vfu_setup_log");
-        goto cleanup;
+        goto cleanup_vfu;
     }
 
     vfu_log(vfu_ctx, LOG_DEBUG, "creating vfu context on %s", opts.sock_path);
@@ -542,21 +563,11 @@ main(int argc, char *argv[])
     ret = vfio_pci_open(&proxy.pci, opts.bdf);
     if (ret < 0) {
         vfu_log(vfu_ctx, LOG_ERR, "vfio_pci_open(%s): %m", opts.bdf);
-        goto cleanup;
+        goto cleanup_vfu;
     }
 
     vfu_log(vfu_ctx, LOG_DEBUG, "device %s opened via libvfn (fd=%d)",
             opts.bdf, proxy.pci.dev.fd);
-
-    proxy.rom_region = (struct vfio_region_info) {
-        .argsz = sizeof(proxy.rom_region),
-        .index = VFIO_PCI_ROM_REGION_INDEX,
-    };
-    if (ioctl(proxy.pci.dev.fd, VFIO_DEVICE_GET_REGION_INFO,
-              &proxy.rom_region) < 0) {
-        vfu_log(vfu_ctx, LOG_DEBUG, "ROM region not available: %m");
-        memset(&proxy.rom_region, 0, sizeof(proxy.rom_region));
-    }
 
     ret = vfu_pci_init(vfu_ctx, VFU_PCI_TYPE_CONVENTIONAL,
                        PCI_HEADER_TYPE_NORMAL, 0);
@@ -577,46 +588,21 @@ main(int argc, char *argv[])
         goto cleanup;
     }
 
-    if (proxy.intx_eventfd >= 0) {
-        vfu_log(vfu_ctx, LOG_DEBUG, "starting IRQ forwarding thread");
-        proxy.irq_thread_running = true;
-        /*
-         * Use a separate thread instead of the non-blocking mode
-         * simply because it does the job and we don't (currently) need the extra complexity.
-         */
-        ret = pthread_create(&proxy.irq_thread, NULL, irq_thread_fn, &proxy);
-        if (ret != 0) {
-            proxy.irq_thread_running = false;
-            errno = ret;
-            vfu_log(vfu_ctx, LOG_ERR, "pthread_create: %m");
-            goto cleanup;
-        }
-    }
-
     vfu_log(vfu_ctx, LOG_INFO, "serving %s on %s", opts.bdf, opts.sock_path);
 
     ret = proxy_run(vfu_ctx);
     vfu_log(vfu_ctx, LOG_DEBUG, "main loop exited (ret=%d)", ret);
 
 cleanup:
-    if (proxy.irq_thread_running) {
-        proxy.irq_thread_running = false;
-        if (vfu_ctx != NULL) {
-            vfu_log(vfu_ctx, LOG_DEBUG, "stopping IRQ thread");
-        }
-        pthread_cancel(proxy.irq_thread);
-        pthread_join(proxy.irq_thread, NULL);
-    }
     if (proxy.intx_eventfd >= 0)
         close(proxy.intx_eventfd);
 
-    if (vfu_ctx != NULL) {
-        vfu_log(vfu_ctx, LOG_DEBUG, "cleaning up");
-        vfu_destroy_ctx(vfu_ctx);
-    }
-    if (proxy.pci.bdf != NULL) {
-        vfio_pci_close(&proxy.pci);
-    }
+    vfu_log(vfu_ctx, LOG_DEBUG, "cleaning up vfio context");
+    vfio_pci_close(&proxy.pci);
+
+cleanup_vfu:
+    vfu_log(vfu_ctx, LOG_DEBUG, "cleaning up vfu context");
+    vfu_destroy_ctx(vfu_ctx);
 
     return ret == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
