@@ -108,43 +108,55 @@ proxy_log(vfu_ctx_t *vfu_ctx UNUSED, UNUSED int level, char const *msg)
     fprintf(stderr, "proxy[%s]: %s\n", log_level_str(level), msg);
 }
 
-static ssize_t
-bar_access_common(vfu_ctx_t *vfu_ctx, int bar_idx, char *buf, size_t count,
-                  loff_t offset, bool is_write)
+static ssize_t pread_write(size_t count;
+                           int fd, void buf[count], size_t count,
+                           off_t offset, bool is_write) {
+	if (is_write) {
+		return pwrite(fd, buf, count, offset);
+	} else {
+		return pread(fd, buf, count, offset);
+	}
+
+}
+
+static ssize_t access_common(vfu_ctx_t *vfu_ctx, char *buf, size_t count,
+		  loff_t vfio_off, bool is_write,  uint64_t region_offset,
+		  const char* region_name)
 {
     struct proxy_data *p = vfu_get_private(vfu_ctx);
-    uint64_t vfio_off = p->pci.bar_region_info[bar_idx].offset + offset;
+    uint64_t vfio_off = region_offset + offset;
     ssize_t ret;
 
-    vfu_log(vfu_ctx, LOG_DEBUG, "BAR%d %s %zu bytes at %#lx (vfio_off %#lx)",
-            bar_idx, is_write ? "write" : "read",
-            count, (unsigned long)offset, (unsigned long)vfio_off);
+    vfu_log(vfu_ctx, LOG_DEBUG, "%s %s %zu bytes at %#lx (vfio_off %#lx)",
+	    region_name, is_write ? "write" : "read",
+	    count, (unsigned long)offset, (unsigned long)vfio_off);
 
-    if (is_write) {
-        ret = pwrite(p->pci.dev.fd, buf, count, vfio_off);
-    } else {
-        ret = pread(p->pci.dev.fd, buf, count, vfio_off);
-    }
+    ret = pread_write(count, p->pci.dev.fd, buf, count, vfio_off, is_write);
 
     if (ret < 0) {
-        vfu_log(vfu_ctx, LOG_ERR, "BAR%d %s at %#lx+%zu: %m",
-                bar_idx, is_write ? "write" : "read",
-                (unsigned long)offset, count);
-        return -1;
+	vfu_log(vfu_ctx, LOG_ERR, "%s %s %zu bytes at %#lx (vfio_off %#lx) returned %d",
+	    region_name, is_write ? "write" : "read",
+	    count, (unsigned long)offset, (unsigned long)vfio_off, (int)ret);
+	return -1;
     }
 
-    vfu_log(vfu_ctx, LOG_DEBUG, "BAR%d %s completed: %zd bytes",
-            bar_idx, is_write ? "write" : "read", ret);
+    vfu_log(vfu_ctx, LOG_DEBUG, "%s %s %zu bytes at %#lx (vfio_off %#lx) returned %d",
+	    region_name, is_write ? "write" : "read",
+	    count, (unsigned long)offset, (unsigned long)vfio_off, (int)ret);
 
     return ret;
 }
 
 #define DEFINE_BAR_CB(n) \
 static ssize_t \
-bar##n##_access(vfu_ctx_t *ctx, char *buf, size_t count, \
+bar##n##_access(vfu_ctx_t *vfu_ctx, char *buf, size_t count, \
                 loff_t offset, bool is_write) \
 { \
-    return bar_access_common(ctx, n, buf, count, offset, is_write); \
+    struct proxy_data *p = vfu_get_private(vfu_ctx); \
+    uint64_t region_offset = p->pci.bar_region_info[n].offset; \
+    const char region_name[] = "BAR" #n; \
+\
+    return access_common(vfu_ctx, buf, count, offset, is_write, region_offset, region_name); \
 }
 
 DEFINE_BAR_CB(0)
@@ -164,29 +176,11 @@ cfg_access(vfu_ctx_t *vfu_ctx, char *buf, size_t count, loff_t offset,
            bool is_write)
 {
     struct proxy_data *p = vfu_get_private(vfu_ctx);
-    ssize_t ret;
+    uint64_t region_offset = p->pci.config_region_info.offset;
 
-    vfu_log(vfu_ctx, LOG_DEBUG, "config %s %zu bytes at %#lx",
-            is_write ? "write" : "read",
-            count, (unsigned long)offset);
+    return acccess_common(vfu_ctx, buf, count, offset, is_write,
+		region_offset, "config");
 
-    if (is_write) {
-        ret = vfio_pci_write_config(&p->pci, buf, count, offset);
-    } else {
-        ret = vfio_pci_read_config(&p->pci, buf, count, offset);
-    }
-
-    if (ret < 0) {
-        vfu_log(vfu_ctx, LOG_ERR, "config %s at %#lx+%zu: %m",
-                is_write ? "write" : "read",
-                (unsigned long)offset, count);
-        return -1;
-    }
-
-    vfu_log(vfu_ctx, LOG_DEBUG, "config %s completed: %zd bytes",
-            is_write ? "write" : "read", ret);
-
-    return ret;
 }
 
 static ssize_t
@@ -194,8 +188,7 @@ rom_access(vfu_ctx_t *vfu_ctx, char *buf, size_t count, loff_t offset,
            bool is_write)
 {
     struct proxy_data *p = vfu_get_private(vfu_ctx);
-    uint64_t vfio_off = p->rom_region.offset + offset;
-    ssize_t ret;
+    uint64_t region_offset = p->rom_region.offset;
 
     if (is_write) {
         vfu_log(vfu_ctx, LOG_WARNING, "ROM write rejected (read-only) at %#lx+%zu",
@@ -204,19 +197,7 @@ rom_access(vfu_ctx_t *vfu_ctx, char *buf, size_t count, loff_t offset,
         return -1;
     }
 
-    vfu_log(vfu_ctx, LOG_DEBUG, "ROM read %zu bytes at %#lx (vfio_off %#lx)",
-            count, (unsigned long)offset, (unsigned long)vfio_off);
-
-    ret = pread(p->pci.dev.fd, buf, count, vfio_off);
-    if (ret < 0) {
-        vfu_log(vfu_ctx, LOG_ERR, "ROM read at %#lx+%zu: %m",
-                (unsigned long)offset, count);
-        return -1;
-    }
-
-    vfu_log(vfu_ctx, LOG_DEBUG, "ROM read completed: %zd bytes", ret);
-
-    return ret;
+    return access_common(vfu_ctx, buf, count, offset, false, region_offset, "ROM");
 }
 
 static void *
@@ -317,6 +298,26 @@ setup_intx(vfu_ctx_t *vfu_ctx)
     return 0;
 }
 
+static int pci_flags_to_vfu_flags(uint32_t bar_val)
+{
+    int vfu_flags = VFU_REGION_FLAG_RW;
+
+    if (!(bar_val & PCI_BASE_ADDRESS_SPACE_IO)) {
+        vfu_flags |= VFU_REGION_FLAG_MEM;
+
+        if ((bar_val & PCI_BASE_ADDRESS_MEM_TYPE_MASK) ==
+              PCI_BASE_ADDRESS_MEM_TYPE_64) {
+            vfu_flags |= VFU_REGION_FLAG_64_BITS;
+        }
+
+        if (bar_val & PCI_BASE_ADDRESS_MEM_PREFETCH) {
+            vfu_flags |= VFU_REGION_FLAG_PREFETCH;
+        }
+    }
+
+    return vfu_flags;
+}
+
 static void
 setup_bars(vfu_ctx_t *vfu_ctx)
 {
@@ -329,7 +330,6 @@ setup_bars(vfu_ctx_t *vfu_ctx)
             vfu_log(vfu_ctx, LOG_DEBUG, "BAR%d is zero size.", i);
             continue;
         }
-        flags = VFU_REGION_FLAG_RW;
 
         if (vfio_pci_read_config(&p->pci, &bar_val, 4,
                                  PCI_BASE_ADDRESS_0 + i * 4) != 4) {
@@ -337,18 +337,7 @@ setup_bars(vfu_ctx_t *vfu_ctx)
             continue;
         }
 
-        if (!(bar_val & PCI_BASE_ADDRESS_SPACE_IO)) {
-            flags |= VFU_REGION_FLAG_MEM;
-
-            if ((bar_val & PCI_BASE_ADDRESS_MEM_TYPE_MASK) ==
-                PCI_BASE_ADDRESS_MEM_TYPE_64) {
-                flags |= VFU_REGION_FLAG_64_BITS;
-            }
-
-            if (bar_val & PCI_BASE_ADDRESS_MEM_PREFETCH) {
-                flags |= VFU_REGION_FLAG_PREFETCH;
-            }
-        }
+        flags = pci_flags_to_vfu_flags(bar_val);
 
         ret = vfu_setup_region(vfu_ctx, VFU_PCI_DEV_BAR0_REGION_IDX + i,
                                p->pci.bar_region_info[i].size, bar_cbs[i],
