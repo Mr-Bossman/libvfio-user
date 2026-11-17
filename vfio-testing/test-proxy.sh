@@ -184,7 +184,7 @@ wait_for_proxy() {
     echo "=== Waiting for proxy socket in L1 ==="
     local i
     for i in $(seq 1 120); do
-        if ssh $SSH_OPTS -p 2222 root@localhost test -S /tmp/proxy.sock 2>/dev/null; then
+        if ssh $SSH_OPTS -p 2222 root@localhost test -S /run/vfio-user-proxy/proxy.sock 2>/dev/null; then
             echo "Proxy socket ready"
             return 0
         fi
@@ -199,7 +199,7 @@ forward_socket() {
 
     echo "=== Forwarding proxy socket via SSH ==="
     rm -f "$tmpdir/proxy.sock"
-    ssh $SSH_OPTS -p 2222 -N -L "$tmpdir/proxy.sock":/tmp/proxy.sock root@localhost &
+    ssh $SSH_OPTS -p 2222 -N -L "$tmpdir/proxy.sock":/run/vfio-user-proxy/proxy.sock root@localhost &
     SSH_PID=$!
     sleep 1
 }

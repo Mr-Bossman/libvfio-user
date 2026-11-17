@@ -31,17 +31,48 @@ build_libvfio() {
     echo "Build OK"
 }
 
-setup_vfio() {
+install_proxy_service() {
     local bdf="$1"
 
-    echo "--- Setting up VFIO ---"
-    modprobe vfio
-    modprobe vfio-pci
-    modprobe vfio_iommu_type1
-    echo 1 > /sys/module/vfio_iommu_type1/parameters/allow_unsafe_interrupts
+    cat > /usr/local/bin/start-pci-proxy.sh << 'EOF'
+#!/bin/bash
+set -e
+BDF="$1"
+if [ -z "$BDF" ] || [ ! -d "/sys/bus/pci/devices/$BDF" ]; then
+    echo "ERROR: invalid BDF: $BDF" >&2
+    exit 1
+fi
+modprobe vfio
+modprobe vfio-pci
+modprobe vfio_iommu_type1
+echo 1 > /sys/module/vfio_iommu_type1/parameters/allow_unsafe_interrupts
+echo vfio-pci > /sys/bus/pci/devices/$BDF/driver_override
+echo $BDF > /sys/bus/pci/drivers_probe
+VFIO_GROUP=$(basename "$(readlink /sys/bus/pci/devices/$BDF/iommu_group)")
+exec /run/live/persistence/vda/libvfio-user/build/samples/vfio-user-proxy -v /run/vfio-user-proxy/proxy.sock $VFIO_GROUP $BDF
+EOF
+    chmod +x /usr/local/bin/start-pci-proxy.sh
 
-    echo vfio-pci > /sys/bus/pci/devices/"$bdf"/driver_override
-    echo "$bdf" > /sys/bus/pci/drivers_probe
+    cat > /etc/systemd/system/vfio-user-proxy.service << EOF
+[Unit]
+Description=vfio-user-proxy
+After=network.target
+
+[Service]
+Type=simple
+RuntimeDirectory=vfio-user-proxy
+ExecStart=/usr/local/bin/start-pci-proxy.sh $bdf
+Restart=on-success
+RestartSec=1
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now vfio-user-proxy
 }
 
 echo "=== vfio-user-proxy test ==="
@@ -53,11 +84,11 @@ build_libvfio
 E1000_BDF=$(lspci -D -d 8086:100e | head -1 | awk '{print $1}')
 if [ -z "$E1000_BDF" ]; then
     echo "ERROR: No e1000 device found"
-    return 1
+    exit 1
 fi
 
-setup_vfio "$E1000_BDF"
+install_proxy_service "$E1000_BDF"
 
-VFIO_GROUP=$(basename "$(readlink /sys/bus/pci/devices/"$E1000_BDF"/iommu_group)")
-"$LIBVFIO_SRC"/build/samples/vfio-user-proxy -v \
-        /tmp/proxy.sock "$VFIO_GROUP" "$E1000_BDF"
+systemctl disable guest-setup.service
+
+echo "=== PROXY READY ==="
