@@ -183,6 +183,18 @@ cfg_access(vfu_ctx_t *vfu_ctx, char *buf, size_t count, loff_t offset,
     struct proxy_data *p = vfu_get_private(vfu_ctx);
     uint64_t region_offset = p->regions[VFIO_PCI_CONFIG_REGION_INDEX].offset;
 
+    /*
+     * Keep MMIO, PIO, and bus-master enabled on the real device regardless
+     * of what the guest writes.  In normal VFIO passthrough the kernel
+     * driver protects these bits; with ALWAYS_CB we must do it ourselves.
+     */
+    if (is_write && offset <= PCI_COMMAND &&
+        (offset + (loff_t)count) > PCI_COMMAND) {
+        size_t cmd_byte = PCI_COMMAND - offset;
+        buf[cmd_byte] |= PCI_COMMAND_IO | PCI_COMMAND_MEMORY |
+                         PCI_COMMAND_MASTER;
+    }
+
     return access_common(vfu_ctx, buf, count, offset, is_write,
                 region_offset, "config");
 }
@@ -492,6 +504,29 @@ err:
     return -1;
 }
 
+static void
+intx_state_cb(vfu_ctx_t *vfu_ctx, uint32_t start UNUSED,
+              uint32_t count UNUSED, bool mask)
+{
+    struct proxy_data *p = vfu_get_private(vfu_ctx);
+    struct vfio_irq_set irq_set = {
+        .argsz = sizeof(irq_set),
+        .flags = VFIO_IRQ_SET_DATA_NONE |
+                 (mask ? VFIO_IRQ_SET_ACTION_MASK
+                       : VFIO_IRQ_SET_ACTION_UNMASK),
+        .index = VFIO_PCI_INTX_IRQ_INDEX,
+        .start = 0,
+        .count = 1,
+    };
+
+    vfu_log(vfu_ctx, LOG_DEBUG, "INTx %s", mask ? "mask" : "unmask");
+
+    if (ioctl(p->device_fd, VFIO_DEVICE_SET_IRQS, &irq_set) < 0) {
+        vfu_log(vfu_ctx, LOG_ERR, "INTx %s failed: %m",
+                mask ? "mask" : "unmask");
+    }
+}
+
 static int
 setup_irqs(vfu_ctx_t *vfu_ctx)
 {
@@ -527,9 +562,18 @@ setup_irqs(vfu_ctx_t *vfu_ctx)
         }
     }
 
-    ret = arm_irq_type(vfu_ctx, VFIO_PCI_INTX_IRQ_INDEX);
-    if (ret < 0) {
-        vfu_log(vfu_ctx, LOG_INFO, "INTx forwarding not available");
+    if (p->irqs[VFIO_PCI_INTX_IRQ_INDEX].count > 0) {
+        ret = arm_irq_type(vfu_ctx, VFIO_PCI_INTX_IRQ_INDEX);
+        if (ret < 0) {
+            vfu_log(vfu_ctx, LOG_INFO, "INTx forwarding not available");
+        } else {
+            ret = vfu_setup_irq_state_callback(vfu_ctx, VFU_DEV_INTX_IRQ,
+                                               intx_state_cb);
+            if (ret < 0) {
+                vfu_log(vfu_ctx, LOG_ERR,
+                        "vfu_setup_irq_state_callback: %m");
+            }
+        }
     }
 
     return 0;
@@ -604,6 +648,12 @@ setup_pci_id(vfu_ctx_t *vfu_ctx)
     uint16_t vendor_id, device_id, subsys_vid, subsys_id;
     uint8_t class_info[3];
     uint8_t ipin;
+
+    vfu_log(vfu_ctx, LOG_INFO,
+            "config region: offset=%#lx size=%#lx fd=%d",
+            (unsigned long)cfg_off,
+            (unsigned long)p->regions[VFIO_PCI_CONFIG_REGION_INDEX].size,
+            p->device_fd);
 
     if (pread(p->device_fd, &vendor_id, 2, cfg_off + PCI_VENDOR_ID) != 2 ||
         pread(p->device_fd, &device_id, 2, cfg_off + PCI_DEVICE_ID) != 2 ||
