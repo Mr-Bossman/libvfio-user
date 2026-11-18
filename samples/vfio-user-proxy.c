@@ -476,26 +476,12 @@ setup_device(vfu_ctx_t *vfu_ctx)
     vfu_log(vfu_ctx, LOG_INFO, "context realized");
 
     vfu_log(vfu_ctx, LOG_DEBUG, "waiting for client connection");
-
-    /* poll for listening socket */
-    p->fds[POLL_VFU].fd = vfu_get_poll_fd(vfu_ctx);
-    p->fds[POLL_VFU].events = POLLIN;
-
-    /* wait for listen socket to be ready */
-    while (vfu_attach_ctx(vfu_ctx) < 0) {
-        ret = errno;
-        if (ret != EAGAIN && ret != EWOULDBLOCK) {
-            errno = ret;
-            vfu_log(vfu_ctx, LOG_ERR, "vfu_attach_ctx: %m");
-            return -1;
-        }
-        if (poll(&p->fds[POLL_VFU], 1, -1) < 0 && errno != EINTR) {
-            vfu_log(vfu_ctx, LOG_ERR, "poll (attach): %m");
-            return -1;
-        }
+    ret = vfu_attach_ctx(vfu_ctx);
+    if (ret < 0) {
+        vfu_log(vfu_ctx, LOG_ERR, "vfu_attach_ctx: %m");
+        return -1;
     }
 
-    /* poll for client connection */
     p->fds[POLL_VFU].fd = vfu_get_poll_fd(vfu_ctx);
     p->fds[POLL_VFU].events = POLLIN;
 
@@ -566,7 +552,7 @@ main(int argc, char *argv[])
     proxy.log_level = opts.log_level;
 
     vfu_ctx = vfu_create_ctx(VFU_TRANS_SOCK, opts.sock_path,
-                             LIBVFIO_USER_FLAG_ATTACH_NB, &proxy,
+                             LIBVFIO_USER_FLAG_RUN_CTX_NB, &proxy,
                              VFU_DEV_TYPE_PCI);
     if (vfu_ctx == NULL) {
         err(EXIT_FAILURE, "vfu_create_ctx");
