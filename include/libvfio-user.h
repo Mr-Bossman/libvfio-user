@@ -496,6 +496,8 @@ typedef struct vfu_dma_info {
     struct iovec mapping;
     size_t page_size;
     uint32_t prot;
+    int fd;
+    off_t offset;
 } vfu_dma_info_t;
 
 /*

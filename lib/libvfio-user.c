@@ -698,7 +698,8 @@ handle_dma_map(vfu_ctx_t *vfu_ctx, vfu_msg_t *msg,
              (ull_t)dma_map->offset,
              dma_map->flags);
 
-    vfu_log(vfu_ctx, LOG_DEBUG, "adding DMA region %s", rstr);
+    vfu_log(vfu_ctx, LOG_DEBUG, "adding DMA region %s nr_fds=%zu", rstr,
+            msg->in.nr_fds);
 
     if (msg->in.nr_fds > 0) {
         fd = consume_fd(msg->in.fds, msg->in.nr_fds, 0);

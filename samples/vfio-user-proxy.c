@@ -64,11 +64,23 @@
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <sys/eventfd.h>
+#include <sys/mman.h>
+#include <linux/pci_regs.h>
 #include <linux/vfio.h>
 
 #include "common.h"
 #include "libvfio-user.h"
 #include "pci_defs.h"
+
+#define MAX_DMA_BOUNCES 64
+
+struct dma_bounce {
+    void *iova_base;
+    size_t size;
+    void *bounce;
+    int fd;
+    bool active;
+};
 
 struct proxy_data {
     int container_fd;
@@ -83,6 +95,8 @@ struct proxy_data {
         uint32_t flags;
     } regions[VFIO_PCI_NUM_REGIONS];
 
+    struct dma_bounce dma_bounces[MAX_DMA_BOUNCES];
+
     struct {
         uint32_t count;
         int *efds;
@@ -92,6 +106,8 @@ struct proxy_data {
     bool irq_thread_running;
     bool no_rom;
     vfu_ctx_t *vfu_ctx;
+    uint8_t msix_cap_off;
+    uint8_t msi_cap_off;
 };
 
 static const char *
@@ -118,6 +134,9 @@ proxy_log(vfu_ctx_t *vfu_ctx UNUSED, UNUSED int level, char const *msg)
     fprintf(stderr, "proxy[%s]: %s\n", log_level_str(level), msg);
 }
 
+static void sync_dma_from_guest(vfu_ctx_t *vfu_ctx);
+static void sync_dma_to_guest(vfu_ctx_t *vfu_ctx);
+
 static ssize_t access_common(vfu_ctx_t *vfu_ctx, char *buf, size_t count,
                   loff_t offset, bool is_write, uint64_t region_offset,
                   const char *region_name)
@@ -129,6 +148,7 @@ static ssize_t access_common(vfu_ctx_t *vfu_ctx, char *buf, size_t count,
     vfu_log(vfu_ctx, LOG_DEBUG, "%s %s %zu bytes at %#lx (vfio_off %#lx)",
             region_name, is_write ? "write" : "read",
             count, (unsigned long)offset, (unsigned long)vfio_off);
+
 
     if (is_write) {
         ret = pwrite(p->device_fd, buf, count, vfio_off);
@@ -160,7 +180,6 @@ bar##n##_access(vfu_ctx_t *vfu_ctx, char *buf, size_t count, \
     struct proxy_data *p = vfu_get_private(vfu_ctx); \
     uint64_t region_offset = p->regions[VFIO_PCI_BAR0_REGION_INDEX + n].offset; \
     const char region_name[] = "BAR" #n; \
-\
     return access_common(vfu_ctx, buf, count, offset, is_write, region_offset, region_name); \
 }
 
@@ -176,12 +195,15 @@ static vfu_region_access_cb_t *bar_cbs[PCI_BARS_NR] = {
     bar3_access, bar4_access, bar5_access,
 };
 
+static int arm_irq_type(vfu_ctx_t *vfu_ctx, int type);
+
 static ssize_t
 cfg_access(vfu_ctx_t *vfu_ctx, char *buf, size_t count, loff_t offset,
            bool is_write)
 {
     struct proxy_data *p = vfu_get_private(vfu_ctx);
     uint64_t region_offset = p->regions[VFIO_PCI_CONFIG_REGION_INDEX].offset;
+    ssize_t ret;
 
     /*
      * Keep MMIO, PIO, and bus-master enabled on the real device regardless
@@ -195,8 +217,50 @@ cfg_access(vfu_ctx_t *vfu_ctx, char *buf, size_t count, loff_t offset,
                          PCI_COMMAND_MASTER;
     }
 
-    return access_common(vfu_ctx, buf, count, offset, is_write,
+    ret = access_common(vfu_ctx, buf, count, offset, is_write,
                 region_offset, "config");
+
+    if (is_write && ret > 0) {
+        loff_t end = offset + count;
+
+        if (p->msix_cap_off != 0) {
+            loff_t ctrl_off = p->msix_cap_off + PCI_MSIX_FLAGS;
+            if (offset <= ctrl_off && end > ctrl_off) {
+                uint16_t ctrl;
+                uint64_t cfg_off = p->regions[VFIO_PCI_CONFIG_REGION_INDEX].offset;
+                if (pread(p->device_fd, &ctrl, 2, cfg_off + ctrl_off) == 2) {
+                    vfu_log(vfu_ctx, LOG_INFO,
+                            "MSI-X control write: ctrl=%#x enable=%d",
+                            ctrl, !!(ctrl & PCI_MSIX_FLAGS_ENABLE));
+                    if (ctrl & PCI_MSIX_FLAGS_ENABLE) {
+                        vfu_log(vfu_ctx, LOG_INFO,
+                                "MSI-X enabled, re-arming eventfds");
+                        arm_irq_type(vfu_ctx, VFIO_PCI_MSIX_IRQ_INDEX);
+                    }
+                }
+            }
+        }
+
+        if (p->msi_cap_off != 0) {
+            loff_t ctrl_off = p->msi_cap_off + PCI_MSI_FLAGS;
+            if (offset <= ctrl_off && end > ctrl_off) {
+                uint16_t ctrl;
+                uint64_t cfg_off = p->regions[VFIO_PCI_CONFIG_REGION_INDEX].offset;
+                if (pread(p->device_fd, &ctrl, 2, cfg_off + ctrl_off) == 2) {
+                    vfu_log(vfu_ctx, LOG_INFO,
+                            "MSI control write: ctrl=%#x enable=%d",
+                            ctrl, !!(ctrl & PCI_MSI_FLAGS_ENABLE));
+                    if (ctrl & PCI_MSI_FLAGS_ENABLE) {
+                        vfu_log(vfu_ctx, LOG_INFO,
+                                "MSI enabled, re-arming eventfds");
+                        arm_irq_type(vfu_ctx, VFIO_PCI_MSI_IRQ_INDEX);
+                    }
+                }
+            }
+        }
+    }
+
+    return ret;
 }
 
 static ssize_t
@@ -255,17 +319,22 @@ irq_thread_fn(void *arg)
         int fd = p->irqs[type].efds[vec];
 
         if (read(fd, &val, sizeof(val)) != (ssize_t)sizeof(val)) {
+            vfu_log(p->vfu_ctx, LOG_DEBUG,
+                    "IRQ thread: eventfd read failed for type=%u vec=%u: %m",
+                    type, vec);
             continue;
         }
 
-        vfu_log(p->vfu_ctx, LOG_DEBUG,
-                "IRQ thread: type=%u vec=%u (count=%lu)",
-                type, vec, (unsigned long)val);
+        vfu_log(p->vfu_ctx, LOG_INFO,
+                "IRQ thread: fired type=%u vec=%u fd=%d count=%lu",
+                type, vec, fd, (unsigned long)val);
 
         if (vfu_irq_trigger(p->vfu_ctx, vec) < 0) {
+            vfu_log(p->vfu_ctx, LOG_ERR,
+                    "IRQ thread: vfu_irq_trigger(vec=%u) failed: %m", vec);
+        } else {
             vfu_log(p->vfu_ctx, LOG_DEBUG,
-                    "IRQ thread: trigger failed, client may not have "
-                    "configured IRQs yet");
+                    "IRQ thread: vfu_irq_trigger(vec=%u) sent to client", vec);
         }
     }
 
@@ -292,6 +361,114 @@ device_reset(vfu_ctx_t *vfu_ctx, vfu_reset_type_t type)
 
     vfu_log(vfu_ctx, LOG_INFO, "device reset successful");
     return 0;
+}
+
+static void
+dma_register(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
+{
+    struct proxy_data *p = vfu_get_private(vfu_ctx);
+    size_t size = info->iova.iov_len;
+    struct vfio_iommu_type1_dma_map dma_map = {
+        .argsz = sizeof(dma_map),
+        .iova = (uintptr_t)info->iova.iov_base,
+        .size = size,
+    };
+    int idx, memfd;
+    void *bounce;
+
+    if (info->prot & PROT_READ) {
+        dma_map.flags |= VFIO_DMA_MAP_FLAG_READ;
+    }
+    if (info->prot & PROT_WRITE) {
+        dma_map.flags |= VFIO_DMA_MAP_FLAG_WRITE;
+    }
+
+    for (idx = 0; idx < MAX_DMA_BOUNCES; idx++) {
+        if (!p->dma_bounces[idx].active) {
+            break;
+        }
+    }
+    if (idx >= MAX_DMA_BOUNCES) {
+        vfu_log(vfu_ctx, LOG_ERR,
+                "DMA bounce slots full, cannot map iova=%#lx",
+                (unsigned long)dma_map.iova);
+        return;
+    }
+
+    memfd = memfd_create("vfio-proxy-dma", MFD_CLOEXEC);
+    if (memfd < 0 || ftruncate(memfd, size) < 0) {
+        vfu_log(vfu_ctx, LOG_ERR,
+                "DMA bounce memfd failed: %m (iova=%#lx size=%#lx)",
+                (unsigned long)dma_map.iova, (unsigned long)size);
+        if (memfd >= 0) {
+            close(memfd);
+        }
+        return;
+    }
+
+    bounce = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+    if (bounce == MAP_FAILED) {
+        vfu_log(vfu_ctx, LOG_ERR,
+                "DMA bounce mmap failed: %m (iova=%#lx size=%#lx)",
+                (unsigned long)dma_map.iova, (unsigned long)size);
+        close(memfd);
+        return;
+    }
+
+    dma_map.vaddr = (uintptr_t)bounce;
+
+    if (ioctl(p->container_fd, VFIO_IOMMU_MAP_DMA, &dma_map) < 0) {
+        vfu_log(vfu_ctx, LOG_ERR,
+                "VFIO_IOMMU_MAP_DMA failed: %m (iova=%#lx size=%#lx vaddr=%#lx)",
+                (unsigned long)dma_map.iova, (unsigned long)size,
+                (unsigned long)dma_map.vaddr);
+        munmap(bounce, size);
+        close(memfd);
+        return;
+    }
+
+    p->dma_bounces[idx].iova_base = info->iova.iov_base;
+    p->dma_bounces[idx].size = size;
+    p->dma_bounces[idx].bounce = bounce;
+    p->dma_bounces[idx].fd = memfd;
+    p->dma_bounces[idx].active = true;
+
+    vfu_log(vfu_ctx, LOG_INFO,
+            "DMA bounce iova=%#lx size=%#lx bounce=%p memfd=%d",
+            (unsigned long)dma_map.iova, (unsigned long)size, bounce, memfd);
+}
+
+static void
+dma_unregister(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
+{
+    struct proxy_data *p = vfu_get_private(vfu_ctx);
+    struct vfio_iommu_type1_dma_unmap dma_unmap = {
+        .argsz = sizeof(dma_unmap),
+        .iova = (uintptr_t)info->iova.iov_base,
+        .size = info->iova.iov_len,
+    };
+    int idx;
+
+    vfu_log(vfu_ctx, LOG_INFO, "DMA unmap iova=%#lx size=%#lx",
+            (unsigned long)dma_unmap.iova, (unsigned long)dma_unmap.size);
+
+    if (ioctl(p->container_fd, VFIO_IOMMU_UNMAP_DMA, &dma_unmap) < 0) {
+        vfu_log(vfu_ctx, LOG_ERR, "VFIO_IOMMU_UNMAP_DMA failed: %m");
+    }
+
+    for (idx = 0; idx < MAX_DMA_BOUNCES; idx++) {
+        if (p->dma_bounces[idx].active &&
+            p->dma_bounces[idx].iova_base == info->iova.iov_base &&
+            p->dma_bounces[idx].size == info->iova.iov_len) {
+            munmap(p->dma_bounces[idx].bounce, p->dma_bounces[idx].size);
+            close(p->dma_bounces[idx].fd);
+            p->dma_bounces[idx].active = false;
+            vfu_log(vfu_ctx, LOG_DEBUG,
+                    "DMA bounce freed iova=%#lx",
+                    (unsigned long)(uintptr_t)info->iova.iov_base);
+            break;
+        }
+    }
 }
 
 static void setup_regions(struct proxy_data *p, uint32_t i)
@@ -436,30 +613,32 @@ arm_irq_type(vfu_ctx_t *vfu_ctx, int type)
         return 0;
     }
 
-    p->irqs[type].efds = calloc(count, sizeof(int));
     if (p->irqs[type].efds == NULL) {
-        return -1;
-    }
-
-    for (i = 0; i < count; i++) {
-        p->irqs[type].efds[i] = eventfd(0, EFD_CLOEXEC);
-        if (p->irqs[type].efds[i] < 0) {
-            vfu_log(vfu_ctx, LOG_ERR,
-                    "eventfd creation failed for IRQ type %d vec %u: %m",
-                    type, i);
-            goto err;
+        p->irqs[type].efds = calloc(count, sizeof(int));
+        if (p->irqs[type].efds == NULL) {
+            return -1;
         }
 
-        struct epoll_event ev = {
-            .events = EPOLLIN,
-            .data.u32 = IRQ_DATA_PACK(type, i),
-        };
-        if (epoll_ctl(p->epoll_fd, EPOLL_CTL_ADD,
-                      p->irqs[type].efds[i], &ev) < 0) {
-            vfu_log(vfu_ctx, LOG_ERR,
-                    "epoll_ctl add failed for IRQ type %d vec %u: %m",
-                    type, i);
-            goto err;
+        for (i = 0; i < count; i++) {
+            p->irqs[type].efds[i] = eventfd(0, EFD_CLOEXEC);
+            if (p->irqs[type].efds[i] < 0) {
+                vfu_log(vfu_ctx, LOG_ERR,
+                        "eventfd creation failed for IRQ type %d vec %u: %m",
+                        type, i);
+                goto err;
+            }
+
+            struct epoll_event ev = {
+                .events = EPOLLIN,
+                .data.u32 = IRQ_DATA_PACK(type, i),
+            };
+            if (epoll_ctl(p->epoll_fd, EPOLL_CTL_ADD,
+                          p->irqs[type].efds[i], &ev) < 0) {
+                vfu_log(vfu_ctx, LOG_ERR,
+                        "epoll_ctl add failed for IRQ type %d vec %u: %m",
+                        type, i);
+                goto err;
+            }
         }
     }
 
@@ -488,7 +667,8 @@ arm_irq_type(vfu_ctx_t *vfu_ctx, int type)
     }
 
     free(irq_set);
-    vfu_log(vfu_ctx, LOG_DEBUG, "IRQ type %d armed (%u vectors)", type, count);
+    vfu_log(vfu_ctx, LOG_INFO, "IRQ type %d armed (%u vectors, efds[0]=%d)",
+            type, count, p->irqs[type].efds[0]);
     return 0;
 
 err:
@@ -562,17 +742,28 @@ setup_irqs(vfu_ctx_t *vfu_ctx)
         }
     }
 
-    if (p->irqs[VFIO_PCI_INTX_IRQ_INDEX].count > 0) {
-        ret = arm_irq_type(vfu_ctx, VFIO_PCI_INTX_IRQ_INDEX);
+    for (i = 0; i < VFU_DEV_NUM_IRQS; i++) {
+        if (p->irqs[i].count == 0) {
+            continue;
+        }
+
+        ret = arm_irq_type(vfu_ctx, i);
         if (ret < 0) {
-            vfu_log(vfu_ctx, LOG_INFO, "INTx forwarding not available");
+            vfu_log(vfu_ctx, LOG_INFO,
+                    "IRQ type %d: arming failed, forwarding not available", i);
         } else {
-            ret = vfu_setup_irq_state_callback(vfu_ctx, VFU_DEV_INTX_IRQ,
-                                               intx_state_cb);
-            if (ret < 0) {
-                vfu_log(vfu_ctx, LOG_ERR,
-                        "vfu_setup_irq_state_callback: %m");
-            }
+            vfu_log(vfu_ctx, LOG_INFO,
+                    "IRQ type %d: armed %u vectors", i, p->irqs[i].count);
+        }
+    }
+
+    if (p->irqs[VFIO_PCI_INTX_IRQ_INDEX].count > 0 &&
+        p->irqs[VFIO_PCI_INTX_IRQ_INDEX].efds != NULL) {
+        ret = vfu_setup_irq_state_callback(vfu_ctx, VFU_DEV_INTX_IRQ,
+                                           intx_state_cb);
+        if (ret < 0) {
+            vfu_log(vfu_ctx, LOG_ERR,
+                    "vfu_setup_irq_state_callback: %m");
         }
     }
 
@@ -687,6 +878,40 @@ setup_pci_id(vfu_ctx_t *vfu_ctx)
     vfu_pci_set_class(vfu_ctx, class_info[2], class_info[1], class_info[0]);
     vfu_pci_get_config_space(vfu_ctx)->hdr.intr.ipin = ipin;
 
+    /* Walk capabilities to find MSI and MSI-X offsets. */
+    uint16_t status;
+    uint8_t cap_ptr, cap_id;
+
+    if (pread(p->device_fd, &status, 2, cfg_off + PCI_STATUS) == 2 &&
+        (status & PCI_STATUS_CAP_LIST)) {
+        if (pread(p->device_fd, &cap_ptr, 1,
+                  cfg_off + PCI_CAPABILITY_LIST) == 1) {
+            cap_ptr &= ~3;
+            while (cap_ptr >= 0x40) {
+                if (pread(p->device_fd, &cap_id, 1,
+                          cfg_off + cap_ptr) != 1) {
+                    break;
+                }
+                vfu_log(vfu_ctx, LOG_DEBUG,
+                        "PCI cap 0x%02x at offset 0x%02x", cap_id, cap_ptr);
+                if (cap_id == PCI_CAP_ID_MSIX) {
+                    p->msix_cap_off = cap_ptr;
+                    vfu_log(vfu_ctx, LOG_INFO,
+                            "MSI-X capability at 0x%02x", cap_ptr);
+                } else if (cap_id == PCI_CAP_ID_MSI) {
+                    p->msi_cap_off = cap_ptr;
+                    vfu_log(vfu_ctx, LOG_INFO,
+                            "MSI capability at 0x%02x", cap_ptr);
+                }
+                if (pread(p->device_fd, &cap_ptr, 1,
+                          cfg_off + cap_ptr + 1) != 1) {
+                    break;
+                }
+                cap_ptr &= ~3;
+            }
+        }
+    }
+
     return 0;
 }
 
@@ -720,6 +945,13 @@ setup_device(vfu_ctx_t *vfu_ctx, bool no_rom)
         return -1;
     }
 
+    ret = vfu_setup_device_dma(vfu_ctx, LIBVFIO_USER_MAX_DMA_REGIONS,
+                               dma_register, dma_unregister);
+    if (ret < 0) {
+        vfu_log(vfu_ctx, LOG_ERR, "vfu_setup_device_dma: %m");
+        return -1;
+    }
+
     ret = setup_irqs(vfu_ctx);
     if (ret < 0) {
         vfu_log(vfu_ctx, LOG_ERR, "IRQ setup failed");
@@ -745,12 +977,75 @@ setup_device(vfu_ctx_t *vfu_ctx, bool no_rom)
     return 0;
 }
 
+static void
+sync_dma_to_guest(vfu_ctx_t *vfu_ctx)
+{
+    struct proxy_data *p = vfu_get_private(vfu_ctx);
+    dma_sg_t *sg = alloca(dma_sg_size());
+
+    for (int i = 0; i < MAX_DMA_BOUNCES; i++) {
+        struct dma_bounce *db = &p->dma_bounces[i];
+        int ret;
+
+        if (!db->active) {
+            continue;
+        }
+
+        ret = vfu_addr_to_sgl(vfu_ctx, (vfu_dma_addr_t)db->iova_base,
+                              db->size, sg, 1, PROT_WRITE);
+        if (ret < 0) {
+            continue;
+        }
+
+        ret = vfu_sgl_write(vfu_ctx, sg, 1, db->bounce, 0);
+        if (ret < 0) {
+            vfu_log(vfu_ctx, LOG_ERR,
+                    "DMA bounce→guest write failed iova=%#lx size=%#lx: %m",
+                    (unsigned long)(uintptr_t)db->iova_base,
+                    (unsigned long)db->size);
+        }
+    }
+}
+
+static void
+sync_dma_from_guest(vfu_ctx_t *vfu_ctx)
+{
+    struct proxy_data *p = vfu_get_private(vfu_ctx);
+    dma_sg_t *sg = alloca(dma_sg_size());
+
+    for (int i = 0; i < MAX_DMA_BOUNCES; i++) {
+        struct dma_bounce *db = &p->dma_bounces[i];
+        int ret;
+
+        if (!db->active) {
+            continue;
+        }
+
+        ret = vfu_addr_to_sgl(vfu_ctx, (vfu_dma_addr_t)db->iova_base,
+                              db->size, sg, 1, PROT_READ);
+        if (ret < 0) {
+            continue;
+        }
+
+        ret = vfu_sgl_read(vfu_ctx, sg, 1, db->bounce, 0);
+        if (ret < 0) {
+            vfu_log(vfu_ctx, LOG_ERR,
+                    "DMA guest bounce read failed iova=%#lx size=%#lx: %m",
+                    (unsigned long)(uintptr_t)db->iova_base,
+                    (unsigned long)db->size);
+        }
+    }
+}
+
 static int
 proxy_run(vfu_ctx_t *vfu_ctx)
 {
     int ret;
 
     do {
+
+    sync_dma_from_guest(vfu_ctx);
+    sync_dma_to_guest(vfu_ctx);
         ret = vfu_run_ctx(vfu_ctx);
         if (ret == -1 && errno == EINTR) {
             vfu_log(vfu_ctx, LOG_DEBUG, "vfu_run_ctx interrupted, retrying");
@@ -934,6 +1229,13 @@ cleanup:
     }
     if (proxy.epoll_fd >= 0) {
         close(proxy.epoll_fd);
+    }
+
+    for (int i = 0; i < MAX_DMA_BOUNCES; i++) {
+        if (proxy.dma_bounces[i].active) {
+            munmap(proxy.dma_bounces[i].bounce, proxy.dma_bounces[i].size);
+            close(proxy.dma_bounces[i].fd);
+        }
     }
 
     vfu_log(vfu_ctx, LOG_DEBUG, "cleaning up vfu context");

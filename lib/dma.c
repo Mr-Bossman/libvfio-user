@@ -422,6 +422,9 @@ MOCK_DEFINE(dma_controller_add_region)(dma_controller_t *dma,
             break;
     }
 
+    region->info.fd = region->fd;
+    region->info.offset = region->offset;
+
     if (btree_iter_insert(&iter, (uintptr_t)dma_addr + size - 1, region) != 0) {
         goto destroy_region;
     }
