@@ -112,20 +112,22 @@ shadow_ioeventfd_server = executable(
 )
 
 
-vfio_user_proxy_sources = [
-    'vfio-user-proxy.c',
-]
+if libvfn_dep.found()
+    vfio_user_proxy_sources = [
+        'vfio-user-proxy.c',
+    ]
 
-vfio_user_proxy_deps = [
-    libvfio_user_dep,
-    thread_dep,
-]
+    vfio_user_proxy_deps = [
+        libvfio_user_dep,
+        libvfn_dep,
+    ]
 
-vfio_user_proxy = executable(
-    'vfio-user-proxy',
-    vfio_user_proxy_sources,
-    c_args: common_cflags,
-    dependencies: vfio_user_proxy_deps,
-    include_directories: lib_include_dir,
-    install: false,
-)
+    vfio_user_proxy = executable(
+        'vfio-user-proxy',
+        vfio_user_proxy_sources,
+        c_args: common_cflags,
+        dependencies: vfio_user_proxy_deps,
+        include_directories: lib_include_dir,
+        install: false,
+    )
+endif

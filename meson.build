@@ -41,6 +41,8 @@ json_c_dep = dependency('json-c', version: '>=' + json_c_version)
 cmocka_version = ''
 cmocka_dep = dependency('cmocka', version: '>=' + cmocka_version)
 
+libvfn_dep = dependency('libvfn', required: false)
+
 pytest = find_program('pytest-3', required: false)
 flake8 = find_program('flake8', required: false)
 misspell_fixer = find_program('misspell-fixer', required: false)
