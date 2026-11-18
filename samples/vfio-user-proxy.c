@@ -74,6 +74,7 @@
 
 #define MAX_DMA_BOUNCES 64
 
+
 struct dma_bounce {
     void *iova_base;
     size_t size;
@@ -96,6 +97,9 @@ struct proxy_data {
     } regions[VFIO_PCI_NUM_REGIONS];
 
     struct dma_bounce dma_bounces[MAX_DMA_BOUNCES];
+
+    void *reg_mmap[VFIO_PCI_NUM_REGIONS];
+    int reg_memfd[VFIO_PCI_NUM_REGIONS];
 
     struct {
         uint32_t count;
@@ -172,6 +176,65 @@ static ssize_t access_common(vfu_ctx_t *vfu_ctx, char *buf, size_t count,
     return ret;
 }
 
+static int
+setup_region_memfd(vfu_ctx_t *vfu_ctx, int region_idx, size_t size,
+                   vfu_region_access_cb_t *cb, int flags)
+{
+    struct proxy_data *p = vfu_get_private(vfu_ctx);
+    int tmpfd, ret;
+    void *map;
+    struct iovec mmap_area = {
+        .iov_base = 0,
+        .iov_len = size,
+    };
+
+    tmpfd = memfd_create("vfio-proxy-region", MFD_CLOEXEC);
+    if (tmpfd < 0 || ftruncate(tmpfd, size) < 0) {
+        vfu_log(vfu_ctx, LOG_ERR,
+                "region %d: memfd_create/ftruncate failed: %m", region_idx);
+        if (tmpfd >= 0) {
+            close(tmpfd);
+        }
+        return vfu_setup_region(vfu_ctx, region_idx, size, cb, flags,
+                                NULL, 0, -1, 0);
+    }
+
+    map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, tmpfd, 0);
+    if (map == MAP_FAILED) {
+        vfu_log(vfu_ctx, LOG_ERR,
+                "region %d: mmap failed: %m", region_idx);
+        close(tmpfd);
+        return vfu_setup_region(vfu_ctx, region_idx, size, cb, flags,
+                                NULL, 0, -1, 0);
+    }
+
+    /* Find the VFIO region index for tracking. */
+    int vfio_idx = -1;
+    if (region_idx >= VFU_PCI_DEV_BAR0_REGION_IDX &&
+        region_idx <= VFU_PCI_DEV_BAR5_REGION_IDX) {
+        vfio_idx = VFIO_PCI_BAR0_REGION_INDEX +
+                   (region_idx - VFU_PCI_DEV_BAR0_REGION_IDX);
+    } else if (region_idx == VFU_PCI_DEV_ROM_REGION_IDX) {
+        vfio_idx = VFIO_PCI_ROM_REGION_INDEX;
+    } else if (region_idx == VFU_PCI_DEV_CFG_REGION_IDX) {
+        vfio_idx = VFIO_PCI_CONFIG_REGION_INDEX;
+    }
+
+    if (vfio_idx >= 0 && vfio_idx < VFIO_PCI_NUM_REGIONS) {
+        p->reg_mmap[vfio_idx] = map;
+        p->reg_memfd[vfio_idx] = tmpfd;
+    }
+
+    ret = vfu_setup_region(vfu_ctx, region_idx, size, cb, flags,
+                           &mmap_area, 1, tmpfd, 0);
+
+    vfu_log(vfu_ctx, LOG_DEBUG,
+            "region %d: size=%#lx memfd=%d mmap=%p",
+            region_idx, (unsigned long)size, tmpfd, map);
+
+    return ret;
+}
+
 #define DEFINE_BAR_CB(n) \
 static ssize_t \
 bar##n##_access(vfu_ctx_t *vfu_ctx, char *buf, size_t count, \
@@ -180,7 +243,17 @@ bar##n##_access(vfu_ctx_t *vfu_ctx, char *buf, size_t count, \
     struct proxy_data *p = vfu_get_private(vfu_ctx); \
     uint64_t region_offset = p->regions[VFIO_PCI_BAR0_REGION_INDEX + n].offset; \
     const char region_name[] = "BAR" #n; \
-    return access_common(vfu_ctx, buf, count, offset, is_write, region_offset, region_name); \
+    int vfio_idx = VFIO_PCI_BAR0_REGION_INDEX + n; \
+    ssize_t ret; \
+\
+    if (is_write && p->reg_mmap[vfio_idx] != NULL) { \
+        memcpy((char *)p->reg_mmap[vfio_idx] + offset, buf, count); \
+    } \
+    ret = access_common(vfu_ctx, buf, count, offset, is_write, region_offset, region_name); \
+    if (ret > 0 && !is_write && p->reg_mmap[vfio_idx] != NULL) { \
+        memcpy((char *)p->reg_mmap[vfio_idx] + offset, buf, ret); \
+    } \
+    return ret; \
 }
 
 DEFINE_BAR_CB(0)
@@ -684,28 +757,54 @@ err:
     return -1;
 }
 
-static void
-intx_state_cb(vfu_ctx_t *vfu_ctx, uint32_t start UNUSED,
-              uint32_t count UNUSED, bool mask)
-{
-    struct proxy_data *p = vfu_get_private(vfu_ctx);
-    struct vfio_irq_set irq_set = {
-        .argsz = sizeof(irq_set),
-        .flags = VFIO_IRQ_SET_DATA_NONE |
-                 (mask ? VFIO_IRQ_SET_ACTION_MASK
-                       : VFIO_IRQ_SET_ACTION_UNMASK),
-        .index = VFIO_PCI_INTX_IRQ_INDEX,
-        .start = 0,
-        .count = 1,
-    };
+static const char *irq_type_name[] = {
+    [VFU_DEV_INTX_IRQ] = "INTx",
+    [VFU_DEV_MSI_IRQ]  = "MSI",
+    [VFU_DEV_MSIX_IRQ] = "MSI-X",
+    [VFU_DEV_ERR_IRQ]  = "ERR",
+    [VFU_DEV_REQ_IRQ]  = "REQ",
+};
 
-    vfu_log(vfu_ctx, LOG_DEBUG, "INTx %s", mask ? "mask" : "unmask");
-
-    if (ioctl(p->device_fd, VFIO_DEVICE_SET_IRQS, &irq_set) < 0) {
-        vfu_log(vfu_ctx, LOG_ERR, "INTx %s failed: %m",
-                mask ? "mask" : "unmask");
-    }
+#define DEFINE_IRQ_STATE_CB(vfu_type, vfio_index) \
+static void \
+vfu_type##_state_cb(vfu_ctx_t *vfu_ctx, uint32_t start, \
+                    uint32_t count, bool mask) \
+{ \
+    struct proxy_data *p = vfu_get_private(vfu_ctx); \
+    struct vfio_irq_set irq_set = { \
+        .argsz = sizeof(irq_set), \
+        .flags = VFIO_IRQ_SET_DATA_NONE | \
+                 (mask ? VFIO_IRQ_SET_ACTION_MASK \
+                       : VFIO_IRQ_SET_ACTION_UNMASK), \
+        .index = vfio_index, \
+        .start = start, \
+        .count = count, \
+    }; \
+\
+    vfu_log(vfu_ctx, LOG_INFO, "%s %s vec [%u, %u)", \
+            irq_type_name[vfu_type], mask ? "mask" : "unmask", \
+            start, start + count); \
+\
+    if (ioctl(p->device_fd, VFIO_DEVICE_SET_IRQS, &irq_set) < 0) { \
+        vfu_log(vfu_ctx, LOG_ERR, "%s %s vec [%u, %u) failed: %m", \
+                irq_type_name[vfu_type], mask ? "mask" : "unmask", \
+                start, start + count); \
+    } \
 }
+
+DEFINE_IRQ_STATE_CB(VFU_DEV_INTX_IRQ, VFIO_PCI_INTX_IRQ_INDEX)
+DEFINE_IRQ_STATE_CB(VFU_DEV_MSI_IRQ, VFIO_PCI_MSI_IRQ_INDEX)
+DEFINE_IRQ_STATE_CB(VFU_DEV_MSIX_IRQ, VFIO_PCI_MSIX_IRQ_INDEX)
+DEFINE_IRQ_STATE_CB(VFU_DEV_ERR_IRQ, VFIO_PCI_ERR_IRQ_INDEX)
+DEFINE_IRQ_STATE_CB(VFU_DEV_REQ_IRQ, VFIO_PCI_REQ_IRQ_INDEX)
+
+static vfu_dev_irq_state_cb_t *irq_state_cbs[] = {
+    [VFU_DEV_INTX_IRQ] = VFU_DEV_INTX_IRQ_state_cb,
+    [VFU_DEV_MSI_IRQ]  = VFU_DEV_MSI_IRQ_state_cb,
+    [VFU_DEV_MSIX_IRQ] = VFU_DEV_MSIX_IRQ_state_cb,
+    [VFU_DEV_ERR_IRQ]  = VFU_DEV_ERR_IRQ_state_cb,
+    [VFU_DEV_REQ_IRQ]  = VFU_DEV_REQ_IRQ_state_cb,
+};
 
 static int
 setup_irqs(vfu_ctx_t *vfu_ctx)
@@ -750,20 +849,20 @@ setup_irqs(vfu_ctx_t *vfu_ctx)
         ret = arm_irq_type(vfu_ctx, i);
         if (ret < 0) {
             vfu_log(vfu_ctx, LOG_INFO,
-                    "IRQ type %d: arming failed, forwarding not available", i);
-        } else {
-            vfu_log(vfu_ctx, LOG_INFO,
-                    "IRQ type %d: armed %u vectors", i, p->irqs[i].count);
+                    "%s: arming failed, forwarding not available",
+                    irq_type_name[i]);
+            continue;
         }
-    }
 
-    if (p->irqs[VFIO_PCI_INTX_IRQ_INDEX].count > 0 &&
-        p->irqs[VFIO_PCI_INTX_IRQ_INDEX].efds != NULL) {
-        ret = vfu_setup_irq_state_callback(vfu_ctx, VFU_DEV_INTX_IRQ,
-                                           intx_state_cb);
+        ret = vfu_setup_irq_state_callback(vfu_ctx, i, irq_state_cbs[i]);
         if (ret < 0) {
             vfu_log(vfu_ctx, LOG_ERR,
-                    "vfu_setup_irq_state_callback: %m");
+                    "%s: vfu_setup_irq_state_callback failed: %m",
+                    irq_type_name[i]);
+        } else {
+            vfu_log(vfu_ctx, LOG_INFO,
+                    "%s: armed %u vectors with state callback",
+                    irq_type_name[i], p->irqs[i].count);
         }
     }
 
@@ -813,24 +912,8 @@ setup_bars(vfu_ctx_t *vfu_ctx)
 
         flags = pci_flags_to_vfu_flags(bar_val);
 
-        if (p->regions[i].flags & VFIO_REGION_INFO_FLAG_MMAP) {
-            struct iovec mmap_area = {
-                .iov_base = 0,
-                .iov_len = p->regions[i].size,
-            };
-            ret = vfu_setup_region(vfu_ctx, VFU_PCI_DEV_BAR0_REGION_IDX + i,
-                                   p->regions[i].size, bar_cbs[i], flags,
-                                   &mmap_area, 1, p->device_fd,
-                                   p->regions[i].offset);
-            vfu_log(vfu_ctx, LOG_DEBUG, "BAR%d size=%#lx flags=%#x (mappable)",
-                    i, (unsigned long)p->regions[i].size, flags);
-        } else {
-            ret = vfu_setup_region(vfu_ctx, VFU_PCI_DEV_BAR0_REGION_IDX + i,
-                                   p->regions[i].size, bar_cbs[i], flags,
-                                   NULL, 0, -1, 0);
-            vfu_log(vfu_ctx, LOG_DEBUG, "BAR%d size=%#lx flags=%#x",
-                    i, (unsigned long)p->regions[i].size, flags);
-        }
+        ret = setup_region_memfd(vfu_ctx, VFU_PCI_DEV_BAR0_REGION_IDX + i,
+                                 p->regions[i].size, bar_cbs[i], flags);
 
         if (ret < 0) {
             vfu_log(vfu_ctx, LOG_ERR, "failed to setup BAR%d: %m", i);
@@ -922,18 +1005,16 @@ setup_device(vfu_ctx_t *vfu_ctx, bool no_rom)
     int ret;
 
     if (!no_rom && p->regions[VFIO_PCI_ROM_REGION_INDEX].size > 0) {
-        ret = vfu_setup_region(vfu_ctx, VFU_PCI_DEV_ROM_REGION_IDX,
-                               p->regions[VFIO_PCI_ROM_REGION_INDEX].size,
-                               &rom_access, VFU_REGION_FLAG_READ,
-                               NULL, 0, -1, 0);
+        ret = setup_region_memfd(vfu_ctx, VFU_PCI_DEV_ROM_REGION_IDX,
+                                 p->regions[VFIO_PCI_ROM_REGION_INDEX].size,
+                                 &rom_access, VFU_REGION_FLAG_READ);
         if (ret < 0) {
             vfu_log(vfu_ctx, LOG_WARNING, "ROM region setup failed: %m");
         }
     }
-    ret = vfu_setup_region(vfu_ctx, VFU_PCI_DEV_CFG_REGION_IDX,
-                           PCI_CFG_SPACE_SIZE, &cfg_access,
-                           VFU_REGION_FLAG_RW | VFU_REGION_FLAG_ALWAYS_CB,
-                           NULL, 0, -1, 0);
+    ret = setup_region_memfd(vfu_ctx, VFU_PCI_DEV_CFG_REGION_IDX,
+                             PCI_CFG_SPACE_SIZE, &cfg_access,
+                             VFU_REGION_FLAG_RW | VFU_REGION_FLAG_ALWAYS_CB);
     if (ret < 0) {
         vfu_log(vfu_ctx, LOG_ERR, "config region setup: %m");
         return -1;
@@ -1141,6 +1222,10 @@ main(int argc, char *argv[])
     };
     struct proxy_opts opts;
     vfu_ctx_t *vfu_ctx;
+
+    for (int i = 0; i < VFIO_PCI_NUM_REGIONS; i++) {
+        proxy.reg_memfd[i] = -1;
+    }
     int group_num, ret;
 
     opts = parse_args(argc, argv);
@@ -1235,6 +1320,14 @@ cleanup:
         if (proxy.dma_bounces[i].active) {
             munmap(proxy.dma_bounces[i].bounce, proxy.dma_bounces[i].size);
             close(proxy.dma_bounces[i].fd);
+        }
+    }
+    for (int i = 0; i < VFIO_PCI_NUM_REGIONS; i++) {
+        if (proxy.reg_mmap[i] != NULL) {
+            munmap(proxy.reg_mmap[i], proxy.regions[i].size);
+        }
+        if (proxy.reg_memfd[i] >= 0) {
+            close(proxy.reg_memfd[i]);
         }
     }
 

@@ -29,9 +29,16 @@
  * torn down (munmap/close on the far side is invisible). Both ends must have
  * the same endianness.
  *
+ * -T: detect changes with write traps instead of diffing. The mapping is kept
+ * PROT_READ; the first store to a page raises SIGSEGV, which flags it dirty and
+ * unprotects it; the scanner re-protects it and sends just that page. CAVEAT:
+ * this only sees stores made through THIS process's mapping. Another process
+ * writing the same memfd through its own mapping (the usual case) never
+ * touches our page tables and is NOT detected.
+ *
  * Build: cc -O2 -Wall -pthread -o fdrelay fdrelay.c
- * Usage: fdrelay listen  <sock> [-i ms] [-F] -- <command...>
- *        fdrelay connect <sock> [-i ms] [-F]      (stdio is the stream)
+ * Usage: fdrelay listen  <sock> [-i ms] [-F] [-T] -- <command...>
+ *        fdrelay connect <sock> [-i ms] [-F] [-T]      (stdio is the stream)
  * Example:
  *   fdrelay listen /tmp/client.sock -- ssh -T host fdrelay connect /tmp/srv.sock
  */
@@ -53,6 +60,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 
 #define PAGE     4096
 #define BLOCK    (1U << 20)
@@ -76,6 +84,7 @@ struct obj {
     size_t size;
     uint8_t *mm, *sh;   /* mem: live mapping, shadow */
     int writable;
+    volatile uint8_t *dirty; /* -T: per-page dirty flags set by SIGSEGV */
     dev_t dev;
     ino_t ino;
 };
@@ -87,6 +96,7 @@ static int epfd, sock, rfd, wfd;
 static uint32_t next_id;
 static unsigned interval_us = 5000;
 static int flush_on_msg = 1;
+static int trap_mode;
 
 /* writer queue */
 struct qitem { struct qitem *next; size_t len; uint8_t buf[]; };
@@ -94,11 +104,51 @@ static struct qitem *qhead, *qtail;
 static pthread_mutex_t qlock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t qcond = PTHREAD_COND_INITIALIZER;
 
+static pid_t child = -1;          /* listen mode: the far-end command */
+static const char *listen_path;  /* listen mode: socket file we created */
+static volatile int busy;        /* writer is mid-write (under qlock) */
+
+/* Remove the socket file and reap the far-end command. Safe to call twice. */
+static void
+cleanup(void)
+{
+    static volatile sig_atomic_t done;
+
+    if (done) {
+        return;
+    }
+    done = 1;
+    if (listen_path) {
+        unlink(listen_path);
+    }
+    if (child > 0) {
+        int i;
+
+        kill(child, SIGTERM);
+        for (i = 0; i < 50 && waitpid(child, NULL, WNOHANG) == 0; i++) {
+            usleep(10000);
+        }
+        if (i == 50) {
+            kill(child, SIGKILL);
+            waitpid(child, NULL, 0);
+        }
+    }
+}
+
+static void
+on_signal(int sig)
+{
+    (void)sig;
+    cleanup();
+    _exit(130);
+}
+
 static void
 __attribute__((noreturn)) die(const char *m)
 {
     fprintf(stderr, "fdrelay: %s%s%s\n", m, errno ? ": " : "",
             errno ? strerror(errno) : "");
+    cleanup();
     _exit(1);
 }
 
@@ -106,6 +156,7 @@ static void
 __attribute__((noreturn)) quit(const char *m)
 {
     fprintf(stderr, "fdrelay: %s\n", m);
+    cleanup();
     _exit(0);
 }
 
@@ -207,11 +258,15 @@ writer_thread(void *arg)
         if (!qhead) {
             qtail = NULL;
         }
+        busy = 1;
         pthread_mutex_unlock(&qlock);
         if (write_full(wfd, q->buf, q->len) < 0) {
             quit("stream closed");
         }
         free(q);
+        pthread_mutex_lock(&qlock);
+        busy = 0;
+        pthread_mutex_unlock(&qlock);
     }
     return NULL;
 }
@@ -262,10 +317,20 @@ map_mem(struct obj *o, int fd)
         o->writable = 0;
         o->mm = mmap(NULL, o->size, PROT_READ, MAP_SHARED, fd, 0);
     }
+    if (o->mm == MAP_FAILED) {
+        return -1;
+    }
+    if (trap_mode && o->writable) {
+        o->dirty = calloc((o->size + PAGE - 1) / PAGE, 1);
+        mprotect(o->mm, o->size, PROT_READ);  /* first store to a page traps */
+        return 0;
+    }
     o->sh = mmap(NULL, o->size, PROT_READ | PROT_WRITE,
                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0); /* starts zeroed */
-    return (o->mm == MAP_FAILED || o->sh == MAP_FAILED) ? -1 : 0;
+    return o->sh == MAP_FAILED ? -1 : 0;
 }
+
+static void scan_nonzero(struct obj *o);
 
 /* An fd arrived from our local app. Returns its object id, or 0 to drop. */
 static uint32_t
@@ -291,6 +356,10 @@ adopt(int fd)
         kind = K_STREAM;
     } else if (S_ISREG(st.st_mode) && st.st_size > 0) {
         kind = K_MEM;
+    } else {
+        fprintf(stderr, "fdrelay: found weird file fd (%s) %d \n", link, st.st_mode & S_IFMT);
+	/* zero-length regular file: treat as a memfd */
+	kind = K_MEM;
     }
     if (!kind) {
         fprintf(stderr, "fdrelay: dropping unsupported fd (%s)\n", link);
@@ -319,6 +388,12 @@ adopt(int fd)
             die("mmap");
         }
         close(fd);
+        if (o->dirty) {
+            emit(T_DECLARE, &(struct declare){ .id = o->id, .kind = kind,
+                 .size = o->size }, sizeof(struct declare), NULL, 0);
+            scan_nonzero(o);
+            return o->id;
+        }
     } else {
         o->fd = fd;
         if (kind == K_EVENTFD) {
@@ -378,13 +453,97 @@ emit_run(struct obj *o, size_t a, size_t b)
     memcpy(p, &id, 4);
     memcpy(p + 4, &off, 8);
     memcpy(p + 12, o->mm + a, b - a);       /* snapshot once ... */
-    memcpy(o->sh + a, p + 12, b - a);       /* ... shadow matches what we send */
+    if (o->sh) {
+        memcpy(o->sh + a, p + 12, b - a);   /* ... shadow matches what we send */
+    }
     queue_put(q);
+}
+
+static int
+page_is_zero(const uint8_t *p, size_t n)
+{
+    static const uint8_t z[PAGE];
+
+    return memcmp(p, z, n) == 0;
+}
+
+/* Send the pages that are non-zero (initial state of a trapped mapping). */
+static void
+scan_nonzero(struct obj *o)
+{
+    size_t run = (size_t)-1;
+
+    for (size_t p = 0; p < o->size; p += PAGE) {
+        size_t q = p + PAGE < o->size ? p + PAGE : o->size;
+
+        if (!page_is_zero(o->mm + p, q - p)) {
+            if (run == (size_t)-1) {
+                run = p;
+            }
+        } else if (run != (size_t)-1) {
+            emit_run(o, run, p);
+            run = (size_t)-1;
+        }
+    }
+    if (run != (size_t)-1) {
+        emit_run(o, run, o->size);
+    }
+}
+
+/*
+ * Trap mode: send only pages the SIGSEGV handler flagged. Re-protect FIRST so
+ * a store racing with the copy faults again and is picked up next round.
+ */
+static void
+scan_dirty(struct obj *o)
+{
+    size_t npages = (o->size + PAGE - 1) / PAGE, run = (size_t)-1;
+
+    for (size_t pg = 0; pg <= npages; pg++) {
+        int d = pg < npages && o->dirty[pg];
+
+        if (d) {
+            o->dirty[pg] = 0;
+            mprotect(o->mm + pg * PAGE, PAGE, PROT_READ);
+            if (run == (size_t)-1) {
+                run = pg * PAGE;
+            }
+        } else if (run != (size_t)-1) {
+            size_t end = pg * PAGE < o->size ? pg * PAGE : o->size;
+
+            emit_run(o, run, end);
+            run = (size_t)-1;
+        }
+    }
+}
+
+static void
+on_segv(int sig, siginfo_t *si, void *ctx)
+{
+    uint8_t *a = si->si_addr;
+
+    (void)ctx;
+    for (int i = 0; i < nobjs; i++) {
+        struct obj *o = objs[i];
+
+        if (o->dirty && a >= o->mm && a < o->mm + o->size) {
+            size_t pg = (a - o->mm) / PAGE;
+
+            o->dirty[pg] = 1;
+            mprotect(o->mm + pg * PAGE, PAGE, PROT_READ | PROT_WRITE);
+            return;
+        }
+    }
+    signal(sig, SIG_DFL);   /* a real crash: re-fault with the default action */
 }
 
 static void
 scan(struct obj *o)
 {
+    if (o->dirty) {
+        scan_dirty(o);
+        return;
+    }
     for (size_t b = 0; b < o->size; b += BLOCK) {
         size_t e = b + BLOCK < o->size ? b + BLOCK : o->size;
         size_t run = (size_t)-1;
@@ -491,6 +650,29 @@ watcher_thread(void *arg)
     }
 }
 
+/*
+ * The local app went away. Let everything already queued reach the far end
+ * (bounded), then close the stream so the far side sees EOF and drops its
+ * own connection, and clean up.
+ */
+static void __attribute__((noreturn))
+local_closed(void)
+{
+    for (int i = 0; i < 400; i++) {
+        int idle;
+
+        pthread_mutex_lock(&qlock);
+        idle = !qhead && !busy;
+        pthread_mutex_unlock(&qlock);
+        if (idle) {
+            break;
+        }
+        usleep(5000);
+    }
+    close(wfd);
+    quit("local socket closed");
+}
+
 /* stream -> local app */
 static void
 deliver(const uint8_t *p, uint32_t len)
@@ -554,7 +736,7 @@ deliver(const uint8_t *p, uint32_t len)
         sent = sendmsg(sock, &mh, MSG_NOSIGNAL);
     } while (sent < 0 && errno == EINTR);
     if (sent < 0 || write_full(sock, data + sent, dlen - sent) < 0) {
-        quit("local socket closed");
+        local_closed();
     }
     while (n--) {
         close(fds[n]);
@@ -600,10 +782,21 @@ stream_reader_thread(void *arg)
                 pthread_mutex_lock(&lock);
                 o = find(id);
                 if (o && o->kind == K_MEM && off + (h.len - 12) <= o->size) {
-                    if (o->writable) {
+                    if (o->dirty) {
+                        size_t a = off & ~(size_t)(PAGE - 1);
+                        size_t b = (off + h.len - 12 + PAGE - 1) &
+                                   ~(size_t)(PAGE - 1);
+
+                        /* our own store must not trap */
+                        mprotect(o->mm + a, b - a, PROT_READ | PROT_WRITE);
                         memcpy(o->mm + off, p + 12, h.len - 12);
+                        mprotect(o->mm + a, b - a, PROT_READ);
+                    } else {
+                        if (o->writable) {
+                            memcpy(o->mm + off, p + 12, h.len - 12);
+                        }
+                        memcpy(o->sh + off, p + 12, h.len - 12); /* no echo */
                     }
-                    memcpy(o->sh + off, p + 12, h.len - 12); /* no echo */
                 }
                 pthread_mutex_unlock(&lock);
             }
@@ -688,7 +881,7 @@ local_reader(void)
             }
         }
         if (n <= 0 && nfds == 0) {
-            quit("local socket closed");
+            local_closed();
         }
         if (n < 0) {
             n = 0;
@@ -721,8 +914,8 @@ static void
 usage(void)
 {
     fprintf(stderr,
-            "usage: fdrelay listen  <sock> [-i ms] [-F] -- <command...>\n"
-            "       fdrelay connect <sock> [-i ms] [-F]\n");
+            "usage: fdrelay listen  <sock> [-i ms] [-F] [-T] -- <command...>\n"
+            "       fdrelay connect <sock> [-i ms] [-F] [-T]\n");
     exit(1);
 }
 
@@ -745,16 +938,27 @@ main(int argc, char **argv)
     }
     strcpy(addr.sun_path, argv[2]);
     optind = 3;
-    while ((opt = getopt(argc, argv, "i:F")) != -1) {
+    while ((opt = getopt(argc, argv, "i:FT")) != -1) {
         if (opt == 'i') {
             interval_us = atof(optarg) * 1000;
         } else if (opt == 'F') {
             flush_on_msg = 0;
+        } else if (opt == 'T') {
+            trap_mode = 1;
         } else {
             usage();
         }
     }
     signal(SIGPIPE, SIG_IGN);
+    if (trap_mode) {
+        struct sigaction sa = { .sa_sigaction = on_segv,
+                                .sa_flags = SA_SIGINFO | SA_NODEFER };
+
+        sigaction(SIGSEGV, &sa, NULL);
+    }
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+    signal(SIGHUP, on_signal);
 
     if (listening) {
         int lfd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -771,12 +975,17 @@ main(int argc, char **argv)
         if (pipe2(up, O_CLOEXEC) < 0 || pipe2(down, O_CLOEXEC) < 0) {
             die("pipe");
         }
-        if (fork() == 0) {
+        listen_path = argv[2];
+        child = fork();
+        if (child == 0) {
+            listen_path = NULL; /* don't unlink the parent's socket */
             dup2(up[0], 0);
             dup2(down[1], 1);
             execvp(argv[optind], &argv[optind]);
             die("exec");
         }
+        close(up[0]);       /* child's ends: else we never see EOF from it */
+        close(down[1]);
         wfd = up[1];
         rfd = down[0];
         next_id = 2;
