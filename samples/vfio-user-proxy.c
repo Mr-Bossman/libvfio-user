@@ -46,10 +46,9 @@
  *   echo 0000:03:00.0 > /sys/bus/pci/drivers/vfio-pci/bind
  *   vfio-user-proxy /tmp/proxy.sock 0000:03:00.0
  *
- * Limitations:
- *   - Only INTx interrupt forwarding is implemented.  MSI/MSI-X vectors
- *     are not forwarded; extending this requires setting up per-vector
- *     eventfds and monitoring them with epoll.
+ * Interrupt forwarding:
+ *   All IRQ types supported by the device (INTx, MSI, MSI-X, ERR, REQ)
+ *   are registered and armed with per-vector eventfds, monitored via epoll.
  */
 
 #include <stdio.h>
@@ -61,8 +60,8 @@
 #include <fcntl.h>
 #include <libgen.h>
 #include <pthread.h>
-#include <signal.h>
 #include <stdbool.h>
+#include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <sys/eventfd.h>
 #include <linux/vfio.h>
@@ -84,7 +83,11 @@ struct proxy_data {
         uint32_t flags;
     } regions[VFIO_PCI_NUM_REGIONS];
 
-    int intx_eventfd;
+    struct {
+        uint32_t count;
+        int *efds;
+    } irqs[VFU_DEV_NUM_IRQS];
+    int epoll_fd;
     pthread_t irq_thread;
     bool irq_thread_running;
     bool no_rom;
@@ -201,32 +204,57 @@ rom_access(vfu_ctx_t *vfu_ctx, char *buf, size_t count, loff_t offset,
     return access_common(vfu_ctx, buf, count, offset, false, region_offset, "ROM");
 }
 
+/*
+ * Encode IRQ type and vector index into epoll_event data so the IRQ thread
+ * can map a fired eventfd back to the right vfu_irq_trigger subindex and
+ * know whether an unmask is needed (INTx only).
+ */
+#define IRQ_DATA_PACK(type, vec)   (((uint32_t)(type) << 16) | (vec))
+#define IRQ_DATA_TYPE(d)           ((d) >> 16)
+#define IRQ_DATA_VEC(d)            ((d) & 0xffff)
+
 static void *
 irq_thread_fn(void *arg)
 {
     struct proxy_data *p = arg;
+    struct epoll_event ev;
     uint64_t val;
-    ssize_t ret;
+    int nfds;
 
-    vfu_log(p->vfu_ctx, LOG_DEBUG, "IRQ thread started (eventfd=%d)",
-            p->intx_eventfd);
+    vfu_log(p->vfu_ctx, LOG_DEBUG, "IRQ thread started (epoll_fd=%d)",
+            p->epoll_fd);
 
     while (p->irq_thread_running) {
-        ret = read(p->intx_eventfd, &val, sizeof(val));
-        if (ret != (ssize_t)sizeof(val)) {
+        nfds = epoll_wait(p->epoll_fd, &ev, 1, 500);
+        if (nfds < 0) {
             if (errno == EINTR) {
-                vfu_log(p->vfu_ctx, LOG_DEBUG,
-                        "IRQ thread: eventfd read interrupted, retrying");
                 continue;
             }
             vfu_log(p->vfu_ctx, LOG_ERR,
-                    "IRQ thread: eventfd read failed (%zd): %m", ret);
+                    "IRQ thread: epoll_wait failed: %m");
             break;
         }
+        if (nfds == 0) {
+            continue;
+        }
+
+        uint32_t type = IRQ_DATA_TYPE(ev.data.u32);
+        uint32_t vec = IRQ_DATA_VEC(ev.data.u32);
+        int fd = p->irqs[type].efds[vec];
+
+        if (read(fd, &val, sizeof(val)) != (ssize_t)sizeof(val)) {
+            continue;
+        }
+
         vfu_log(p->vfu_ctx, LOG_DEBUG,
-                "IRQ thread: forwarding INTx (count=%lu)",
-                (unsigned long)val);
-        vfu_irq_trigger(p->vfu_ctx, 0);
+                "IRQ thread: type=%u vec=%u (count=%lu)",
+                type, vec, (unsigned long)val);
+
+        if (vfu_irq_trigger(p->vfu_ctx, vec) < 0) {
+            vfu_log(p->vfu_ctx, LOG_DEBUG,
+                    "IRQ thread: trigger failed, client may not have "
+                    "configured IRQs yet");
+        }
     }
 
     vfu_log(p->vfu_ctx, LOG_DEBUG, "IRQ thread exiting");
@@ -383,56 +411,126 @@ setup_vfio(struct proxy_data *p, int group_num, const char *bdf)
 }
 
 static int
-setup_intx(vfu_ctx_t *vfu_ctx)
+arm_irq_type(vfu_ctx_t *vfu_ctx, int type)
 {
     struct proxy_data *p = vfu_get_private(vfu_ctx);
-    struct vfio_irq_info irq = {
-        .argsz = sizeof(irq),
-        .index = VFIO_PCI_INTX_IRQ_INDEX,
-    };
-    struct {
-        struct vfio_irq_set hdr;
-        int32_t fd;
-    } irq_set;
+    uint32_t count = p->irqs[type].count;
+    size_t set_sz;
+    struct vfio_irq_set *irq_set;
+    int *fds;
+    uint32_t i;
 
-    if (ioctl(p->device_fd, VFIO_DEVICE_GET_IRQ_INFO, &irq) < 0) {
-        vfu_log(vfu_ctx, LOG_INFO, "INTx IRQ info query failed: %m");
+    if (count == 0) {
+        return 0;
+    }
+
+    p->irqs[type].efds = calloc(count, sizeof(int));
+    if (p->irqs[type].efds == NULL) {
         return -1;
     }
 
-    if (irq.count == 0) {
-        vfu_log(vfu_ctx, LOG_INFO, "INTx not available (count=0)");
+    for (i = 0; i < count; i++) {
+        p->irqs[type].efds[i] = eventfd(0, EFD_CLOEXEC);
+        if (p->irqs[type].efds[i] < 0) {
+            vfu_log(vfu_ctx, LOG_ERR,
+                    "eventfd creation failed for IRQ type %d vec %u: %m",
+                    type, i);
+            goto err;
+        }
+
+        struct epoll_event ev = {
+            .events = EPOLLIN,
+            .data.u32 = IRQ_DATA_PACK(type, i),
+        };
+        if (epoll_ctl(p->epoll_fd, EPOLL_CTL_ADD,
+                      p->irqs[type].efds[i], &ev) < 0) {
+            vfu_log(vfu_ctx, LOG_ERR,
+                    "epoll_ctl add failed for IRQ type %d vec %u: %m",
+                    type, i);
+            goto err;
+        }
+    }
+
+    set_sz = sizeof(*irq_set) + count * sizeof(int);
+    irq_set = calloc(1, set_sz);
+    if (irq_set == NULL) {
+        goto err;
+    }
+
+    irq_set->argsz = set_sz;
+    irq_set->flags = VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_TRIGGER;
+    irq_set->index = type;
+    irq_set->start = 0;
+    irq_set->count = count;
+
+    fds = (int *)(irq_set + 1);
+    for (i = 0; i < count; i++) {
+        fds[i] = p->irqs[type].efds[i];
+    }
+
+    if (ioctl(p->device_fd, VFIO_DEVICE_SET_IRQS, irq_set) < 0) {
+        vfu_log(vfu_ctx, LOG_ERR,
+                "VFIO_DEVICE_SET_IRQS type %d failed: %m", type);
+        free(irq_set);
+        goto err;
+    }
+
+    free(irq_set);
+    vfu_log(vfu_ctx, LOG_DEBUG, "IRQ type %d armed (%u vectors)", type, count);
+    return 0;
+
+err:
+    for (i = 0; i < count; i++) {
+        if (p->irqs[type].efds[i] >= 0) {
+            epoll_ctl(p->epoll_fd, EPOLL_CTL_DEL,
+                      p->irqs[type].efds[i], NULL);
+            close(p->irqs[type].efds[i]);
+        }
+    }
+    free(p->irqs[type].efds);
+    p->irqs[type].efds = NULL;
+    return -1;
+}
+
+static int
+setup_irqs(vfu_ctx_t *vfu_ctx)
+{
+    struct proxy_data *p = vfu_get_private(vfu_ctx);
+    struct vfio_irq_info irq;
+    int i, ret;
+
+    p->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (p->epoll_fd < 0) {
+        vfu_log(vfu_ctx, LOG_ERR, "epoll_create1 failed: %m");
         return -1;
     }
 
-    vfu_log(vfu_ctx, LOG_DEBUG, "INTx info: count=%u flags=%#x",
-            irq.count, irq.flags);
+    for (i = 0; i < VFU_DEV_NUM_IRQS; i++) {
+        memset(&irq, 0, sizeof(irq));
+        irq.argsz = sizeof(irq);
+        irq.index = i;
 
-    p->intx_eventfd = eventfd(0, EFD_CLOEXEC);
-    if (p->intx_eventfd < 0) {
-        vfu_log(vfu_ctx, LOG_ERR, "eventfd creation failed: %m");
-        return -1;
+        if (ioctl(p->device_fd, VFIO_DEVICE_GET_IRQ_INFO, &irq) < 0 ||
+            irq.count == 0) {
+            continue;
+        }
+
+        p->irqs[i].count = irq.count;
+
+        vfu_log(vfu_ctx, LOG_DEBUG, "IRQ type %d: count=%u flags=%#x",
+                i, irq.count, irq.flags);
+
+        ret = vfu_setup_device_nr_irqs(vfu_ctx, i, irq.count);
+        if (ret < 0) {
+            vfu_log(vfu_ctx, LOG_ERR, "vfu_setup_device_nr_irqs(%d): %m", i);
+            return -1;
+        }
     }
 
-    vfu_log(vfu_ctx, LOG_DEBUG, "INTx eventfd=%d", p->intx_eventfd);
-
-    memset(&irq_set, 0, sizeof(irq_set));
-    irq_set.hdr.argsz = sizeof(irq_set);
-    irq_set.hdr.flags = VFIO_IRQ_SET_DATA_EVENTFD |
-                         VFIO_IRQ_SET_ACTION_TRIGGER;
-    irq_set.hdr.index = VFIO_PCI_INTX_IRQ_INDEX;
-    irq_set.hdr.start = 0;
-    irq_set.hdr.count = 1;
-    irq_set.fd = p->intx_eventfd;
-
-    if (ioctl(p->device_fd, VFIO_DEVICE_SET_IRQS, &irq_set) < 0) {
-        vfu_log(vfu_ctx, LOG_ERR, "VFIO_DEVICE_SET_IRQS failed: %m");
-        close(p->intx_eventfd);
-        p->intx_eventfd = -1;
-        return -1;
+    ret = arm_irq_type(vfu_ctx, VFIO_PCI_INTX_IRQ_INDEX);
+    if (ret < 0) {
+        vfu_log(vfu_ctx, LOG_INFO, "INTx forwarding not available");
     }
-
-    vfu_log(vfu_ctx, LOG_DEBUG, "INTx eventfd armed");
 
     return 0;
 }
@@ -505,23 +603,26 @@ setup_pci_id(vfu_ctx_t *vfu_ctx)
     uint64_t cfg_off = p->regions[VFIO_PCI_CONFIG_REGION_INDEX].offset;
     uint16_t vendor_id, device_id, subsys_vid, subsys_id;
     uint8_t class_info[3];
+    uint8_t ipin;
 
     if (pread(p->device_fd, &vendor_id, 2, cfg_off + PCI_VENDOR_ID) != 2 ||
         pread(p->device_fd, &device_id, 2, cfg_off + PCI_DEVICE_ID) != 2 ||
         pread(p->device_fd, &subsys_vid, 2, cfg_off + PCI_SUBSYSTEM_VENDOR_ID) != 2 ||
         pread(p->device_fd, &subsys_id, 2, cfg_off + PCI_SUBSYSTEM_ID) != 2 ||
-        pread(p->device_fd, class_info, 3, cfg_off + PCI_CLASS_PROG) != 3) {
+        pread(p->device_fd, class_info, 3, cfg_off + PCI_CLASS_PROG) != 3 ||
+        pread(p->device_fd, &ipin, 1, cfg_off + PCI_INTERRUPT_PIN) != 1) {
         vfu_log(vfu_ctx, LOG_ERR, "failed to read PCI config identity fields");
         return -1;
     }
 
     vfu_log(vfu_ctx, LOG_INFO, "PCI ID [%04x:%04x] subsys [%04x:%04x] "
-            "class %02x%02x%02x",
+            "class %02x%02x%02x ipin=%u",
             vendor_id, device_id, subsys_vid, subsys_id,
-            class_info[2], class_info[1], class_info[0]);
+            class_info[2], class_info[1], class_info[0], ipin);
 
     vfu_pci_set_id(vfu_ctx, vendor_id, device_id, subsys_vid, subsys_id);
     vfu_pci_set_class(vfu_ctx, class_info[2], class_info[1], class_info[0]);
+    vfu_pci_get_config_space(vfu_ctx)->hdr.intr.ipin = ipin;
 
     return 0;
 }
@@ -556,16 +657,10 @@ setup_device(vfu_ctx_t *vfu_ctx, bool no_rom)
         return -1;
     }
 
-    ret = vfu_setup_device_nr_irqs(vfu_ctx, VFU_DEV_INTX_IRQ, 1);
+    ret = setup_irqs(vfu_ctx);
     if (ret < 0) {
-        vfu_log(vfu_ctx, LOG_ERR, "vfu_setup_device_nr_irqs: %m");
+        vfu_log(vfu_ctx, LOG_ERR, "IRQ setup failed");
         return -1;
-    }
-
-    if (setup_intx(vfu_ctx) == 0) {
-        vfu_log(vfu_ctx, LOG_INFO, "INTx forwarding enabled");
-    } else {
-        vfu_log(vfu_ctx, LOG_INFO, "INTx forwarding not available");
     }
 
     vfu_log(vfu_ctx, LOG_DEBUG, "realizing context");
@@ -683,7 +778,7 @@ main(int argc, char *argv[])
         .container_fd = -1,
         .group_fd = -1,
         .device_fd = -1,
-        .intx_eventfd = -1,
+        .epoll_fd = -1,
         .log_level = LOG_ERR,
     };
     struct proxy_opts opts;
@@ -740,13 +835,9 @@ main(int argc, char *argv[])
         goto cleanup;
     }
 
-    if (proxy.intx_eventfd >= 0) {
+    if (proxy.epoll_fd >= 0) {
         vfu_log(vfu_ctx, LOG_DEBUG, "starting IRQ forwarding thread");
         proxy.irq_thread_running = true;
-        /*
-         * Use a separate thread instead of the non-blocking mode
-         * simply because it does the job and we don't (currently) need the extra complexity.
-         */
         ret = pthread_create(&proxy.irq_thread, NULL, irq_thread_fn, &proxy);
         if (ret != 0) {
             proxy.irq_thread_running = false;
@@ -770,8 +861,17 @@ cleanup:
         pthread_cancel(proxy.irq_thread);
         pthread_join(proxy.irq_thread, NULL);
     }
-    if (proxy.intx_eventfd >= 0)
-        close(proxy.intx_eventfd);
+    for (int i = 0; i < VFU_DEV_NUM_IRQS; i++) {
+        for (uint32_t j = 0; j < proxy.irqs[i].count; j++) {
+            if (proxy.irqs[i].efds && proxy.irqs[i].efds[j] >= 0) {
+                close(proxy.irqs[i].efds[j]);
+            }
+        }
+        free(proxy.irqs[i].efds);
+    }
+    if (proxy.epoll_fd >= 0) {
+        close(proxy.epoll_fd);
+    }
 
     vfu_log(vfu_ctx, LOG_DEBUG, "cleaning up vfu context");
     vfu_destroy_ctx(vfu_ctx);
