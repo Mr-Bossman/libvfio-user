@@ -622,16 +622,29 @@ setup_bars(vfu_ctx_t *vfu_ctx)
 
         flags = pci_flags_to_vfu_flags(bar_val);
 
-        ret = vfu_setup_region(vfu_ctx, VFU_PCI_DEV_BAR0_REGION_IDX + i,
-                               p->regions[i].size, bar_cbs[i], flags,
-                               NULL, 0, -1, 0);
+        if (p->regions[i].flags & VFIO_REGION_INFO_FLAG_MMAP) {
+            struct iovec mmap_area = {
+                .iov_base = 0,
+                .iov_len = p->regions[i].size,
+            };
+            ret = vfu_setup_region(vfu_ctx, VFU_PCI_DEV_BAR0_REGION_IDX + i,
+                                   p->regions[i].size, bar_cbs[i], flags,
+                                   &mmap_area, 1, p->device_fd,
+                                   p->regions[i].offset);
+            vfu_log(vfu_ctx, LOG_DEBUG, "BAR%d size=%#lx flags=%#x (mappable)",
+                    i, (unsigned long)p->regions[i].size, flags);
+        } else {
+            ret = vfu_setup_region(vfu_ctx, VFU_PCI_DEV_BAR0_REGION_IDX + i,
+                                   p->regions[i].size, bar_cbs[i], flags,
+                                   NULL, 0, -1, 0);
+            vfu_log(vfu_ctx, LOG_DEBUG, "BAR%d size=%#lx flags=%#x",
+                    i, (unsigned long)p->regions[i].size, flags);
+        }
+
         if (ret < 0) {
             vfu_log(vfu_ctx, LOG_ERR, "failed to setup BAR%d: %m", i);
             continue;
         }
-
-        vfu_log(vfu_ctx, LOG_DEBUG, "BAR%d size=%#lx flags=%#x",
-                i, (unsigned long)p->regions[i].size, flags);
 
         /* 64-bit BARs span two consecutive indices; skip the upper half. */
         if (flags & VFU_REGION_FLAG_64_BITS) {
