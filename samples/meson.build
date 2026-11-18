@@ -117,7 +117,7 @@ vfio_user_proxy_sources = [
 ]
 
 vfio_user_proxy_deps = [
-    libvfio_user_dep,
+    libvfio_user_static_dep,
     thread_dep,
 ]
 
