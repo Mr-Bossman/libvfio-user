@@ -46,4 +46,18 @@ libvfio_user_dep = declare_dependency(
     include_directories: public_include_dir,
 )
 
+libvfio_user_static = static_library(
+    'vfio-user',
+    sources: libvfio_user_sources,
+    c_args: libvfio_user_cflags + common_cflags,
+    dependencies: libvfio_user_deps,
+    include_directories: public_include_dir,
+)
+
+libvfio_user_static_dep = declare_dependency(
+    link_with: libvfio_user_static,
+    dependencies: libvfio_user_deps,
+    include_directories: public_include_dir,
+)
+
 libvfio_so_dir = meson.current_build_dir()
