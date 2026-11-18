@@ -476,15 +476,30 @@ setup_device(vfu_ctx_t *vfu_ctx)
     vfu_log(vfu_ctx, LOG_INFO, "context realized");
 
     vfu_log(vfu_ctx, LOG_DEBUG, "waiting for client connection");
-    ret = vfu_attach_ctx(vfu_ctx);
-    if (ret < 0) {
-        vfu_log(vfu_ctx, LOG_ERR, "vfu_attach_ctx: %m");
-        return -1;
-    }
-    vfu_log(vfu_ctx, LOG_INFO, "client connected");
 
+    /* poll for listening socket */
     p->fds[POLL_VFU].fd = vfu_get_poll_fd(vfu_ctx);
     p->fds[POLL_VFU].events = POLLIN;
+
+    /* wait for listen socket to be ready */
+    while (vfu_attach_ctx(vfu_ctx) < 0) {
+        ret = errno;
+        if (ret != EAGAIN && ret != EWOULDBLOCK) {
+            errno = ret;
+            vfu_log(vfu_ctx, LOG_ERR, "vfu_attach_ctx: %m");
+            return -1;
+        }
+        if (poll(&p->fds[POLL_VFU], 1, -1) < 0 && errno != EINTR) {
+            vfu_log(vfu_ctx, LOG_ERR, "poll (attach): %m");
+            return -1;
+        }
+    }
+
+    /* poll for client connection */
+    p->fds[POLL_VFU].fd = vfu_get_poll_fd(vfu_ctx);
+    p->fds[POLL_VFU].events = POLLIN;
+
+    vfu_log(vfu_ctx, LOG_INFO, "client connected");
 
     return 0;
 }

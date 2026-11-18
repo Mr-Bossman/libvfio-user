@@ -13,7 +13,7 @@ install_packages() {
     apt-get update
     apt-get install -y \
         build-essential meson ninja-build libjson-c-dev libcmocka-dev \
-        pkg-config pciutils kmod openssh-server
+        pkg-config pciutils kmod openssh-server git libnvme-dev
     apt-get clean
 }
 
@@ -23,10 +23,21 @@ setup_ssh() {
     systemctl enable --now ssh
 }
 
+build_libvfn() {
+    echo "--- Building and installing libvfn ---"
+    git clone https://github.com/SamsungDS/libvfn.git /tmp/libvfn
+    cd /tmp/libvfn
+    meson setup build -Ddocs=disabled
+    ninja -C build
+    meson install -C build
+    ldconfig
+    echo "libvfn installed"
+}
+
 build_libvfio() {
     echo "--- Building libvfio-user ---"
     cd "$LIBVFIO_SRC"
-    meson setup build
+    meson setup build --reconfigure || meson setup build
     ninja -C build samples/vfio-user-proxy
     echo "Build OK"
 }
@@ -78,6 +89,7 @@ echo "=== vfio-user-proxy test ==="
 
 install_packages
 setup_ssh
+build_libvfn
 build_libvfio
 
 E1000_BDF=$(lspci -D -d 8086:100e | head -1 | awk '{print $1}')
