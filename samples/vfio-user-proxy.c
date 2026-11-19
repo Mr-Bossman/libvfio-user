@@ -279,6 +279,7 @@ static vfu_region_access_cb_t *bar_cbs[PCI_BARS_NR] = {
 };
 
 static int arm_irq_type(vfu_ctx_t *vfu_ctx, int type);
+static int build_poll_fds(vfu_ctx_t *vfu_ctx);
 
 static ssize_t
 cfg_access(vfu_ctx_t *vfu_ctx, char *buf, size_t count, loff_t offset,
@@ -317,8 +318,9 @@ cfg_access(vfu_ctx_t *vfu_ctx, char *buf, size_t count, loff_t offset,
                             ctrl, !!(ctrl & PCI_MSIX_FLAGS_ENABLE));
                     if (ctrl & PCI_MSIX_FLAGS_ENABLE) {
                         vfu_log(vfu_ctx, LOG_INFO,
-                                "MSI-X enabled, re-arming eventfds");
+                                "MSI-X enabled, arming eventfds");
                         arm_irq_type(vfu_ctx, VFIO_PCI_MSIX_IRQ_INDEX);
+                        build_poll_fds(vfu_ctx);
                     }
                 }
             }
@@ -335,8 +337,9 @@ cfg_access(vfu_ctx_t *vfu_ctx, char *buf, size_t count, loff_t offset,
                             ctrl, !!(ctrl & PCI_MSI_FLAGS_ENABLE));
                     if (ctrl & PCI_MSI_FLAGS_ENABLE) {
                         vfu_log(vfu_ctx, LOG_INFO,
-                                "MSI enabled, re-arming eventfds");
+                                "MSI enabled, arming eventfds");
                         arm_irq_type(vfu_ctx, VFIO_PCI_MSI_IRQ_INDEX);
+                        build_poll_fds(vfu_ctx);
                     }
                 }
             }
@@ -770,17 +773,29 @@ setup_irqs(vfu_ctx_t *vfu_ctx)
         }
     }
 
+    /*
+     * Only arm INTx, ERR, and REQ at startup.  MSI/MSI-X must wait until
+     * the guest enables them (detected in cfg_access), because the kernel
+     * VFIO driver only supports one of INTx/MSI/MSI-X active at a time —
+     * arming MSI-X here would disable INTx before the guest is ready.
+     */
     for (i = 0; i < VFU_DEV_NUM_IRQS; i++) {
         if (p->irqs[i].count == 0) {
             continue;
         }
 
-        ret = arm_irq_type(vfu_ctx, i);
-        if (ret < 0) {
-            vfu_log(vfu_ctx, LOG_INFO,
-                    "%s: arming failed, forwarding not available",
-                    irq_type_name[i]);
-            continue;
+        if (i == VFU_DEV_INTX_IRQ || i == VFU_DEV_ERR_IRQ ||
+            i == VFU_DEV_REQ_IRQ) {
+            ret = arm_irq_type(vfu_ctx, i);
+            if (ret < 0) {
+                vfu_log(vfu_ctx, LOG_INFO,
+                        "%s: arming failed, forwarding not available",
+                        irq_type_name[i]);
+            } else {
+                vfu_log(vfu_ctx, LOG_INFO,
+                        "%s: armed %u vectors",
+                        irq_type_name[i], p->irqs[i].count);
+            }
         }
 
         ret = vfu_setup_irq_state_callback(vfu_ctx, i, irq_state_cbs[i]);
@@ -788,10 +803,6 @@ setup_irqs(vfu_ctx_t *vfu_ctx)
             vfu_log(vfu_ctx, LOG_ERR,
                     "%s: vfu_setup_irq_state_callback failed: %m",
                     irq_type_name[i]);
-        } else {
-            vfu_log(vfu_ctx, LOG_INFO,
-                    "%s: armed %u vectors with state callback",
-                    irq_type_name[i], p->irqs[i].count);
         }
     }
 
@@ -940,6 +951,9 @@ build_poll_fds(vfu_ctx_t *vfu_ctx)
             total += p->irqs[i].count;
         }
     }
+
+    free(p->fds);
+    free(p->irq_map);
 
     p->fds = calloc(total, sizeof(struct pollfd));
     p->irq_map = calloc(total, sizeof(struct poll_irq_entry));
