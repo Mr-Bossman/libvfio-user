@@ -48,7 +48,7 @@
  *
  * Interrupt forwarding:
  *   All IRQ types supported by the device (INTx, MSI, MSI-X, ERR, REQ)
- *   are registered and armed with per-vector eventfds, monitored via epoll.
+ *   are registered and armed with per-vector eventfds, monitored via poll().
  */
 
 #include <stdio.h>
@@ -59,9 +59,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
-#include <pthread.h>
+#include <poll.h>
 #include <stdbool.h>
-#include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
@@ -74,13 +73,22 @@
 
 #define MAX_DMA_BOUNCES 64
 
-
 struct dma_bounce {
     void *iova_base;
     size_t size;
     void *bounce;
     int fd;
     bool active;
+};
+
+struct poll_irq_entry {
+    int type;
+    int vec;
+};
+
+enum {
+    POLL_VFU = 0,
+    POLL_IRQ_START,
 };
 
 struct proxy_data {
@@ -105,9 +113,11 @@ struct proxy_data {
         uint32_t count;
         int *efds;
     } irqs[VFU_DEV_NUM_IRQS];
-    int epoll_fd;
-    pthread_t irq_thread;
-    bool irq_thread_running;
+
+    struct pollfd *fds;
+    struct poll_irq_entry *irq_map;
+    int nfds;
+
     bool no_rom;
     vfu_ctx_t *vfu_ctx;
     uint8_t msix_cap_off;
@@ -353,67 +363,6 @@ rom_access(vfu_ctx_t *vfu_ctx, char *buf, size_t count, loff_t offset,
     return access_common(vfu_ctx, buf, count, offset, false, region_offset, "ROM");
 }
 
-/*
- * Encode IRQ type and vector index into epoll_event data so the IRQ thread
- * can map a fired eventfd back to the right vfu_irq_trigger subindex and
- * know whether an unmask is needed (INTx only).
- */
-#define IRQ_DATA_PACK(type, vec)   (((uint32_t)(type) << 16) | (vec))
-#define IRQ_DATA_TYPE(d)           ((d) >> 16)
-#define IRQ_DATA_VEC(d)            ((d) & 0xffff)
-
-static void *
-irq_thread_fn(void *arg)
-{
-    struct proxy_data *p = arg;
-    struct epoll_event ev;
-    uint64_t val;
-    int nfds;
-
-    vfu_log(p->vfu_ctx, LOG_DEBUG, "IRQ thread started (epoll_fd=%d)",
-            p->epoll_fd);
-
-    while (p->irq_thread_running) {
-        nfds = epoll_wait(p->epoll_fd, &ev, 1, 500);
-        if (nfds < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            vfu_log(p->vfu_ctx, LOG_ERR,
-                    "IRQ thread: epoll_wait failed: %m");
-            break;
-        }
-        if (nfds == 0) {
-            continue;
-        }
-
-        uint32_t type = IRQ_DATA_TYPE(ev.data.u32);
-        uint32_t vec = IRQ_DATA_VEC(ev.data.u32);
-        int fd = p->irqs[type].efds[vec];
-
-        if (read(fd, &val, sizeof(val)) != (ssize_t)sizeof(val)) {
-            vfu_log(p->vfu_ctx, LOG_DEBUG,
-                    "IRQ thread: eventfd read failed for type=%u vec=%u: %m",
-                    type, vec);
-            continue;
-        }
-
-        vfu_log(p->vfu_ctx, LOG_INFO,
-                "IRQ thread: fired type=%u vec=%u fd=%d count=%lu",
-                type, vec, fd, (unsigned long)val);
-
-        if (vfu_irq_trigger(p->vfu_ctx, vec) < 0) {
-            vfu_log(p->vfu_ctx, LOG_ERR,
-                    "IRQ thread: vfu_irq_trigger(vec=%u) failed: %m", vec);
-        } else {
-            vfu_log(p->vfu_ctx, LOG_DEBUG,
-                    "IRQ thread: vfu_irq_trigger(vec=%u) sent to client", vec);
-        }
-    }
-
-    vfu_log(p->vfu_ctx, LOG_DEBUG, "IRQ thread exiting");
-    return NULL;
-}
 
 static int
 device_reset(vfu_ctx_t *vfu_ctx, vfu_reset_type_t type)
@@ -693,22 +642,10 @@ arm_irq_type(vfu_ctx_t *vfu_ctx, int type)
         }
 
         for (i = 0; i < count; i++) {
-            p->irqs[type].efds[i] = eventfd(0, EFD_CLOEXEC);
+            p->irqs[type].efds[i] = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
             if (p->irqs[type].efds[i] < 0) {
                 vfu_log(vfu_ctx, LOG_ERR,
                         "eventfd creation failed for IRQ type %d vec %u: %m",
-                        type, i);
-                goto err;
-            }
-
-            struct epoll_event ev = {
-                .events = EPOLLIN,
-                .data.u32 = IRQ_DATA_PACK(type, i),
-            };
-            if (epoll_ctl(p->epoll_fd, EPOLL_CTL_ADD,
-                          p->irqs[type].efds[i], &ev) < 0) {
-                vfu_log(vfu_ctx, LOG_ERR,
-                        "epoll_ctl add failed for IRQ type %d vec %u: %m",
                         type, i);
                 goto err;
             }
@@ -747,8 +684,6 @@ arm_irq_type(vfu_ctx_t *vfu_ctx, int type)
 err:
     for (i = 0; i < count; i++) {
         if (p->irqs[type].efds[i] >= 0) {
-            epoll_ctl(p->epoll_fd, EPOLL_CTL_DEL,
-                      p->irqs[type].efds[i], NULL);
             close(p->irqs[type].efds[i]);
         }
     }
@@ -812,12 +747,6 @@ setup_irqs(vfu_ctx_t *vfu_ctx)
     struct proxy_data *p = vfu_get_private(vfu_ctx);
     struct vfio_irq_info irq;
     int i, ret;
-
-    p->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
-    if (p->epoll_fd < 0) {
-        vfu_log(vfu_ctx, LOG_ERR, "epoll_create1 failed: %m");
-        return -1;
-    }
 
     for (i = 0; i < VFU_DEV_NUM_IRQS; i++) {
         memset(&irq, 0, sizeof(irq));
@@ -999,6 +928,55 @@ setup_pci_id(vfu_ctx_t *vfu_ctx)
 }
 
 static int
+build_poll_fds(vfu_ctx_t *vfu_ctx)
+{
+    struct proxy_data *p = vfu_get_private(vfu_ctx);
+    int total = POLL_IRQ_START;
+    int idx, i;
+    uint32_t j;
+
+    for (i = 0; i < VFU_DEV_NUM_IRQS; i++) {
+        if (p->irqs[i].efds != NULL) {
+            total += p->irqs[i].count;
+        }
+    }
+
+    p->fds = calloc(total, sizeof(struct pollfd));
+    p->irq_map = calloc(total, sizeof(struct poll_irq_entry));
+    if (p->fds == NULL || p->irq_map == NULL) {
+        free(p->fds);
+        free(p->irq_map);
+        p->fds = NULL;
+        p->irq_map = NULL;
+        return -1;
+    }
+
+    p->fds[POLL_VFU].fd = vfu_get_poll_fd(vfu_ctx);
+    p->fds[POLL_VFU].events = POLLIN;
+
+    idx = POLL_IRQ_START;
+    for (i = 0; i < VFU_DEV_NUM_IRQS; i++) {
+        if (p->irqs[i].efds == NULL) {
+            continue;
+        }
+        for (j = 0; j < p->irqs[i].count; j++) {
+            p->fds[idx].fd = p->irqs[i].efds[j];
+            p->fds[idx].events = POLLIN;
+            p->irq_map[idx].type = i;
+            p->irq_map[idx].vec = j;
+            idx++;
+        }
+    }
+
+    p->nfds = total;
+
+    vfu_log(vfu_ctx, LOG_INFO, "poll fds: %d total (%d IRQ vectors)",
+            total, total - POLL_IRQ_START);
+
+    return 0;
+}
+
+static int
 setup_device(vfu_ctx_t *vfu_ctx, bool no_rom)
 {
     struct proxy_data *p = vfu_get_private(vfu_ctx);
@@ -1054,6 +1032,12 @@ setup_device(vfu_ctx_t *vfu_ctx, bool no_rom)
         return -1;
     }
     vfu_log(vfu_ctx, LOG_INFO, "client connected");
+
+    ret = build_poll_fds(vfu_ctx);
+    if (ret < 0) {
+        vfu_log(vfu_ctx, LOG_ERR, "build_poll_fds: %m");
+        return -1;
+    }
 
     return 0;
 }
@@ -1121,26 +1105,68 @@ sync_dma_from_guest(vfu_ctx_t *vfu_ctx)
 static int
 proxy_run(vfu_ctx_t *vfu_ctx)
 {
-    int ret;
+    struct proxy_data *p = vfu_get_private(vfu_ctx);
+    uint64_t val;
+    ssize_t cnt;
+    int ret, i;
 
-    do {
+    for (;;) {
+        sync_dma_from_guest(vfu_ctx);
+        sync_dma_to_guest(vfu_ctx);
 
-    sync_dma_from_guest(vfu_ctx);
-    sync_dma_to_guest(vfu_ctx);
-        ret = vfu_run_ctx(vfu_ctx);
-        if (ret == -1 && errno == EINTR) {
-            vfu_log(vfu_ctx, LOG_DEBUG, "vfu_run_ctx interrupted, retrying");
-            ret = 0;
-        } else if (ret == -1 && errno == ENOTCONN) {
-            vfu_log(vfu_ctx, LOG_INFO, "client disconnected");
-            ret = 0;
-            break;
-        } else if (ret == -1) {
-            vfu_log(vfu_ctx, LOG_ERR, "vfu_run_ctx returned error: %m");
+        ret = poll(p->fds, p->nfds, -1);
+        if (ret < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            vfu_log(vfu_ctx, LOG_ERR, "poll: %m");
+            return -1;
         }
-    } while (ret == 0);
 
-    return ret;
+        for (i = POLL_IRQ_START; i < p->nfds; i++) {
+            if (!(p->fds[i].revents & POLLIN)) {
+                continue;
+            }
+            cnt = read(p->fds[i].fd, &val, sizeof(val));
+            if (cnt == (ssize_t)sizeof(val)) {
+                int type = p->irq_map[i].type;
+                int vec = p->irq_map[i].vec;
+
+                vfu_log(vfu_ctx, LOG_DEBUG,
+                        "IRQ fired type=%d vec=%d count=%lu",
+                        type, vec, (unsigned long)val);
+
+                if (vfu_irq_trigger(vfu_ctx, vec) < 0) {
+                    vfu_log(vfu_ctx, LOG_ERR,
+                            "vfu_irq_trigger(vec=%d) failed: %m", vec);
+                }
+            }
+            if (cnt < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                vfu_log(vfu_ctx, LOG_ERR,
+                        "read IRQ eventfd idx=%d: %m", i);
+            }
+        }
+
+        if (p->fds[POLL_VFU].revents & POLLIN) {
+            ret = vfu_run_ctx(vfu_ctx);
+            if (ret < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    continue;
+                }
+                if (errno == ENOTCONN) {
+                    vfu_log(vfu_ctx, LOG_INFO, "client disconnected");
+                    return 0;
+                }
+                vfu_log(vfu_ctx, LOG_ERR, "vfu_run_ctx: %m");
+                return -1;
+            }
+        }
+
+        if (p->fds[POLL_VFU].revents & (POLLHUP | POLLERR)) {
+            vfu_log(vfu_ctx, LOG_INFO, "poll fd error/hangup");
+            return 0;
+        }
+    }
 }
 
 static int
@@ -1217,7 +1243,6 @@ main(int argc, char *argv[])
         .container_fd = -1,
         .group_fd = -1,
         .device_fd = -1,
-        .epoll_fd = -1,
         .log_level = LOG_ERR,
     };
     struct proxy_opts opts;
@@ -1278,32 +1303,12 @@ main(int argc, char *argv[])
         goto cleanup;
     }
 
-    if (proxy.epoll_fd >= 0) {
-        vfu_log(vfu_ctx, LOG_DEBUG, "starting IRQ forwarding thread");
-        proxy.irq_thread_running = true;
-        ret = pthread_create(&proxy.irq_thread, NULL, irq_thread_fn, &proxy);
-        if (ret != 0) {
-            proxy.irq_thread_running = false;
-            errno = ret;
-            vfu_log(vfu_ctx, LOG_ERR, "pthread_create: %m");
-            goto cleanup;
-        }
-    }
-
     vfu_log(vfu_ctx, LOG_INFO, "serving %s on %s", opts.bdf, opts.sock_path);
 
     ret = proxy_run(vfu_ctx);
     vfu_log(vfu_ctx, LOG_DEBUG, "main loop exited (ret=%d)", ret);
 
 cleanup:
-    if (proxy.irq_thread_running) {
-        proxy.irq_thread_running = false;
-        if (vfu_ctx != NULL) {
-            vfu_log(vfu_ctx, LOG_DEBUG, "stopping IRQ thread");
-        }
-        pthread_cancel(proxy.irq_thread);
-        pthread_join(proxy.irq_thread, NULL);
-    }
     for (int i = 0; i < VFU_DEV_NUM_IRQS; i++) {
         for (uint32_t j = 0; j < proxy.irqs[i].count; j++) {
             if (proxy.irqs[i].efds && proxy.irqs[i].efds[j] >= 0) {
@@ -1312,9 +1317,8 @@ cleanup:
         }
         free(proxy.irqs[i].efds);
     }
-    if (proxy.epoll_fd >= 0) {
-        close(proxy.epoll_fd);
-    }
+    free(proxy.fds);
+    free(proxy.irq_map);
 
     for (int i = 0; i < MAX_DMA_BOUNCES; i++) {
         if (proxy.dma_bounces[i].active) {
