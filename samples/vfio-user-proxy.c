@@ -148,9 +148,6 @@ proxy_log(vfu_ctx_t *vfu_ctx UNUSED, UNUSED int level, char const *msg)
     fprintf(stderr, "proxy[%s]: %s\n", log_level_str(level), msg);
 }
 
-static void sync_dma_from_guest(vfu_ctx_t *vfu_ctx);
-static void sync_dma_to_guest(vfu_ctx_t *vfu_ctx);
-
 static ssize_t access_common(vfu_ctx_t *vfu_ctx, char *buf, size_t count,
                   loff_t offset, bool is_write, uint64_t region_offset,
                   const char *region_name)
@@ -382,6 +379,15 @@ device_reset(vfu_ctx_t *vfu_ctx, vfu_reset_type_t type)
     if (ioctl(p->device_fd, VFIO_DEVICE_RESET) < 0) {
         vfu_log(vfu_ctx, LOG_ERR, "VFIO_DEVICE_RESET: %m");
         return -1;
+    }
+
+    /* VFIO_DEVICE_RESET clears kernel IRQ trigger state; re-arm. */
+    if (p->irqs[VFU_DEV_INTX_IRQ].efds != NULL) {
+        if (arm_irq_type(vfu_ctx, VFU_DEV_INTX_IRQ) < 0) {
+            vfu_log(vfu_ctx, LOG_ERR, "failed to re-arm INTx after reset");
+        } else {
+            vfu_log(vfu_ctx, LOG_INFO, "re-armed INTx after reset");
+        }
     }
 
     vfu_log(vfu_ctx, LOG_INFO, "device reset successful");
@@ -703,47 +709,6 @@ static const char *irq_type_name[] = {
     [VFU_DEV_REQ_IRQ]  = "REQ",
 };
 
-#define DEFINE_IRQ_STATE_CB(vfu_type, vfio_index) \
-static void \
-vfu_type##_state_cb(vfu_ctx_t *vfu_ctx, uint32_t start, \
-                    uint32_t count, bool mask) \
-{ \
-    struct proxy_data *p = vfu_get_private(vfu_ctx); \
-    struct vfio_irq_set irq_set = { \
-        .argsz = sizeof(irq_set), \
-        .flags = VFIO_IRQ_SET_DATA_NONE | \
-                 (mask ? VFIO_IRQ_SET_ACTION_MASK \
-                       : VFIO_IRQ_SET_ACTION_UNMASK), \
-        .index = vfio_index, \
-        .start = start, \
-        .count = count, \
-    }; \
-\
-    vfu_log(vfu_ctx, LOG_INFO, "%s %s vec [%u, %u)", \
-            irq_type_name[vfu_type], mask ? "mask" : "unmask", \
-            start, start + count); \
-\
-    if (ioctl(p->device_fd, VFIO_DEVICE_SET_IRQS, &irq_set) < 0) { \
-        vfu_log(vfu_ctx, LOG_ERR, "%s %s vec [%u, %u) failed: %m", \
-                irq_type_name[vfu_type], mask ? "mask" : "unmask", \
-                start, start + count); \
-    } \
-}
-
-DEFINE_IRQ_STATE_CB(VFU_DEV_INTX_IRQ, VFIO_PCI_INTX_IRQ_INDEX)
-DEFINE_IRQ_STATE_CB(VFU_DEV_MSI_IRQ, VFIO_PCI_MSI_IRQ_INDEX)
-DEFINE_IRQ_STATE_CB(VFU_DEV_MSIX_IRQ, VFIO_PCI_MSIX_IRQ_INDEX)
-DEFINE_IRQ_STATE_CB(VFU_DEV_ERR_IRQ, VFIO_PCI_ERR_IRQ_INDEX)
-DEFINE_IRQ_STATE_CB(VFU_DEV_REQ_IRQ, VFIO_PCI_REQ_IRQ_INDEX)
-
-static vfu_dev_irq_state_cb_t *irq_state_cbs[] = {
-    [VFU_DEV_INTX_IRQ] = VFU_DEV_INTX_IRQ_state_cb,
-    [VFU_DEV_MSI_IRQ]  = VFU_DEV_MSI_IRQ_state_cb,
-    [VFU_DEV_MSIX_IRQ] = VFU_DEV_MSIX_IRQ_state_cb,
-    [VFU_DEV_ERR_IRQ]  = VFU_DEV_ERR_IRQ_state_cb,
-    [VFU_DEV_REQ_IRQ]  = VFU_DEV_REQ_IRQ_state_cb,
-};
-
 static int
 setup_irqs(vfu_ctx_t *vfu_ctx)
 {
@@ -763,46 +728,28 @@ setup_irqs(vfu_ctx_t *vfu_ctx)
 
         p->irqs[i].count = irq.count;
 
-        vfu_log(vfu_ctx, LOG_DEBUG, "IRQ type %d: count=%u flags=%#x",
-                i, irq.count, irq.flags);
-
-        ret = vfu_setup_device_nr_irqs(vfu_ctx, i, irq.count);
-        if (ret < 0) {
-            vfu_log(vfu_ctx, LOG_ERR, "vfu_setup_device_nr_irqs(%d): %m", i);
-            return -1;
-        }
+        vfu_log(vfu_ctx, LOG_DEBUG, "IRQ type %d (%s): count=%u flags=%#x",
+                i, irq_type_name[i], irq.count, irq.flags);
     }
 
     /*
-     * Only arm INTx, ERR, and REQ at startup.  MSI/MSI-X must wait until
-     * the guest enables them (detected in cfg_access), because the kernel
-     * VFIO driver only supports one of INTx/MSI/MSI-X active at a time —
-     * arming MSI-X here would disable INTx before the guest is ready.
+     * Only advertise INTx to the client.  Registering MSI/MSI-X with
+     * libvfio-user causes QEMU to switch away from INTx and the shared
+     * efds[] array gets overwritten, breaking INTx forwarding.
      */
-    for (i = 0; i < VFU_DEV_NUM_IRQS; i++) {
-        if (p->irqs[i].count == 0) {
-            continue;
-        }
-
-        if (i == VFU_DEV_INTX_IRQ || i == VFU_DEV_ERR_IRQ ||
-            i == VFU_DEV_REQ_IRQ) {
-            ret = arm_irq_type(vfu_ctx, i);
-            if (ret < 0) {
-                vfu_log(vfu_ctx, LOG_INFO,
-                        "%s: arming failed, forwarding not available",
-                        irq_type_name[i]);
-            } else {
-                vfu_log(vfu_ctx, LOG_INFO,
-                        "%s: armed %u vectors",
-                        irq_type_name[i], p->irqs[i].count);
-            }
-        }
-
-        ret = vfu_setup_irq_state_callback(vfu_ctx, i, irq_state_cbs[i]);
+    if (p->irqs[VFU_DEV_INTX_IRQ].count > 0) {
+        ret = vfu_setup_device_nr_irqs(vfu_ctx, VFU_DEV_INTX_IRQ, 1);
         if (ret < 0) {
-            vfu_log(vfu_ctx, LOG_ERR,
-                    "%s: vfu_setup_irq_state_callback failed: %m",
-                    irq_type_name[i]);
+            vfu_log(vfu_ctx, LOG_ERR, "vfu_setup_device_nr_irqs(INTx): %m");
+            return -1;
+        }
+
+        ret = arm_irq_type(vfu_ctx, VFU_DEV_INTX_IRQ);
+        if (ret < 0) {
+            vfu_log(vfu_ctx, LOG_INFO,
+                    "INTx: arming failed, forwarding not available");
+        } else {
+            vfu_log(vfu_ctx, LOG_INFO, "INTx: armed");
         }
     }
 
@@ -1056,66 +1003,6 @@ setup_device(vfu_ctx_t *vfu_ctx, bool no_rom)
     return 0;
 }
 
-static void
-sync_dma_to_guest(vfu_ctx_t *vfu_ctx)
-{
-    struct proxy_data *p = vfu_get_private(vfu_ctx);
-    dma_sg_t *sg = alloca(dma_sg_size());
-
-    for (int i = 0; i < MAX_DMA_BOUNCES; i++) {
-        struct dma_bounce *db = &p->dma_bounces[i];
-        int ret;
-
-        if (!db->active) {
-            continue;
-        }
-
-        ret = vfu_addr_to_sgl(vfu_ctx, (vfu_dma_addr_t)db->iova_base,
-                              db->size, sg, 1, PROT_WRITE);
-        if (ret < 0) {
-            continue;
-        }
-
-        ret = vfu_sgl_write(vfu_ctx, sg, 1, db->bounce, 0);
-        if (ret < 0) {
-            vfu_log(vfu_ctx, LOG_ERR,
-                    "DMA bounce→guest write failed iova=%#lx size=%#lx: %m",
-                    (unsigned long)(uintptr_t)db->iova_base,
-                    (unsigned long)db->size);
-        }
-    }
-}
-
-static void
-sync_dma_from_guest(vfu_ctx_t *vfu_ctx)
-{
-    struct proxy_data *p = vfu_get_private(vfu_ctx);
-    dma_sg_t *sg = alloca(dma_sg_size());
-
-    for (int i = 0; i < MAX_DMA_BOUNCES; i++) {
-        struct dma_bounce *db = &p->dma_bounces[i];
-        int ret;
-
-        if (!db->active) {
-            continue;
-        }
-
-        ret = vfu_addr_to_sgl(vfu_ctx, (vfu_dma_addr_t)db->iova_base,
-                              db->size, sg, 1, PROT_READ);
-        if (ret < 0) {
-            continue;
-        }
-
-        ret = vfu_sgl_read(vfu_ctx, sg, 1, db->bounce, 0);
-        if (ret < 0) {
-            vfu_log(vfu_ctx, LOG_ERR,
-                    "DMA guest bounce read failed iova=%#lx size=%#lx: %m",
-                    (unsigned long)(uintptr_t)db->iova_base,
-                    (unsigned long)db->size);
-        }
-    }
-}
-
 static int
 proxy_run(vfu_ctx_t *vfu_ctx)
 {
@@ -1125,9 +1012,6 @@ proxy_run(vfu_ctx_t *vfu_ctx)
     int ret, i;
 
     for (;;) {
-        sync_dma_from_guest(vfu_ctx);
-        sync_dma_to_guest(vfu_ctx);
-
         ret = poll(p->fds, p->nfds, -1);
         if (ret < 0) {
             if (errno == EINTR) {
@@ -1146,7 +1030,7 @@ proxy_run(vfu_ctx_t *vfu_ctx)
                 int type = p->irq_map[i].type;
                 int vec = p->irq_map[i].vec;
 
-                vfu_log(vfu_ctx, LOG_DEBUG,
+                vfu_log(vfu_ctx, LOG_ERR,
                         "IRQ fired type=%d vec=%d count=%lu",
                         type, vec, (unsigned long)val);
 
@@ -1154,11 +1038,14 @@ proxy_run(vfu_ctx_t *vfu_ctx)
                     vfu_log(vfu_ctx, LOG_ERR,
                             "vfu_irq_trigger(vec=%d) failed: %m", vec);
                 }
-            }
-            if (cnt < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            }else if (cnt < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                 vfu_log(vfu_ctx, LOG_ERR,
                         "read IRQ eventfd idx=%d: %m", i);
-            }
+            } else {
+		vfu_log(vfu_ctx, LOG_ERR,
+                        "size was not the same as expected for INTx (count=%lu)",
+                        (unsigned long)cnt);
+	    }
         }
 
         if (p->fds[POLL_VFU].revents & POLLIN) {
@@ -1271,7 +1158,8 @@ main(int argc, char *argv[])
     group_num = get_iommu_group(opts.bdf);
     proxy.log_level = opts.log_level;
 
-    vfu_ctx = vfu_create_ctx(VFU_TRANS_SOCK, opts.sock_path, 0, &proxy,
+    vfu_ctx = vfu_create_ctx(VFU_TRANS_SOCK, opts.sock_path,
+                             LIBVFIO_USER_FLAG_RUN_CTX_NB, &proxy,
                              VFU_DEV_TYPE_PCI);
     if (vfu_ctx == NULL) {
         err(EXIT_FAILURE, "vfu_create_ctx");
