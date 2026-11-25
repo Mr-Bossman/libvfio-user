@@ -102,7 +102,7 @@ struct proxy_data {
 
     struct {
         uint64_t size;
-        uint64_t offset;
+        loff_t offset;
         uint32_t flags;
     } regions[VFIO_PCI_NUM_REGIONS];
 
@@ -157,11 +157,11 @@ proxy_log(vfu_ctx_t *vfu_ctx, int level, char const *msg)
 }
 
 static ssize_t access_common(vfu_ctx_t *vfu_ctx, char *buf, size_t count,
-                  loff_t offset, bool is_write, uint64_t region_offset,
+                  loff_t offset, bool is_write, loff_t region_offset,
                   const char *region_name)
 {
     struct proxy_data *p = vfu_get_private(vfu_ctx);
-    uint64_t vfio_off = region_offset + offset;
+    loff_t vfio_off = region_offset + offset;
     ssize_t ret;
 
     vfu_log(vfu_ctx, LOG_DEBUG, "%s %s %zu bytes at %#llx (vfio_off %#llx)",
@@ -194,7 +194,7 @@ bar##n##_access(vfu_ctx_t *vfu_ctx, char *buf, size_t count, \
                 loff_t offset, bool is_write) \
 { \
     struct proxy_data *p = vfu_get_private(vfu_ctx); \
-    uint64_t region_offset = p->regions[VFIO_PCI_BAR0_REGION_INDEX + n].offset; \
+    loff_t region_offset = p->regions[VFIO_PCI_BAR0_REGION_INDEX + n].offset; \
     const char region_name[] = "BAR" #n; \
 \
     return access_common(vfu_ctx, buf, count, offset, is_write, region_offset, region_name); \
@@ -217,7 +217,7 @@ cfg_access(vfu_ctx_t *vfu_ctx, char *buf, size_t count, loff_t offset,
            bool is_write)
 {
     struct proxy_data *p = vfu_get_private(vfu_ctx);
-    uint64_t region_offset = p->regions[VFIO_PCI_CONFIG_REGION_INDEX].offset;
+    loff_t region_offset = p->regions[VFIO_PCI_CONFIG_REGION_INDEX].offset;
 
     return access_common(vfu_ctx, buf, count, offset, is_write,
                 region_offset, "config");
@@ -228,7 +228,7 @@ rom_access(vfu_ctx_t *vfu_ctx, char *buf, size_t count, loff_t offset,
            bool is_write)
 {
     struct proxy_data *p = vfu_get_private(vfu_ctx);
-    uint64_t region_offset = p->regions[VFIO_PCI_ROM_REGION_INDEX].offset;
+    loff_t region_offset = p->regions[VFIO_PCI_ROM_REGION_INDEX].offset;
 
     if (is_write) {
         vfu_log(vfu_ctx, LOG_WARNING, "ROM write rejected (read-only) at %#llx+%zu",
@@ -271,8 +271,12 @@ static void setup_regions(struct proxy_data *p, uint32_t i)
 
     if (ioctl(p->device_fd, VFIO_DEVICE_GET_REGION_INFO, &ri) == 0) {
         p->regions[i].size = ri.size;
-        p->regions[i].offset = ri.offset;
+        p->regions[i].offset = (loff_t)ri.offset;
         p->regions[i].flags = ri.flags;
+        if ((loff_t)ri.offset < 0) {
+            vfu_log(vfu_ctx, LOG_ERR, "region %u: offset %#llx is to big for loff_t",
+                    i, (unsigned long long)ri.offset);
+        }
         if (ri.size > 0) {
             vfu_log(vfu_ctx, LOG_DEBUG,
                    "region %u: size=%#llx offset=%#llx flags=%#x",
@@ -423,7 +427,7 @@ proxy_irq_set_state(vfu_ctx_t *vfu_ctx, enum vfu_irq_type index, uint32_t start,
                     uint32_t count, bool mask)
 {
     struct proxy_data *p = vfu_get_private(vfu_ctx);
-    size_t set_sz;
+    uint32_t set_sz;
     struct vfio_irq_set *irq_set;
     int *fds;
     size_t i, k;
@@ -500,7 +504,7 @@ proxy_irq_set_state(vfu_ctx_t *vfu_ctx, enum vfu_irq_type index, uint32_t start,
 
     irq_set->argsz = set_sz;
     irq_set->flags = VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_TRIGGER;
-    irq_set->index = index;
+    irq_set->index = (uint32_t)index;
     irq_set->start = 0;
     irq_set->count = p->irq_count[index];
     fds = (int *)(irq_set->data);
@@ -557,7 +561,7 @@ setup_irq_type(vfu_ctx_t *vfu_ctx, enum vfu_irq_type index)
     struct proxy_data *p = vfu_get_private(vfu_ctx);
     struct vfio_irq_info irq = {
         .argsz = sizeof(irq),
-        .index = index,
+        .index = (uint32_t)index,
     };
 
     if (ioctl(p->device_fd, VFIO_DEVICE_GET_IRQ_INFO, &irq) < 0) {
@@ -651,7 +655,7 @@ static int
 setup_bars(vfu_ctx_t *vfu_ctx)
 {
     struct proxy_data *p = vfu_get_private(vfu_ctx);
-    uint64_t cfg_off = p->regions[VFIO_PCI_CONFIG_REGION_INDEX].offset;
+    loff_t cfg_off = p->regions[VFIO_PCI_CONFIG_REGION_INDEX].offset;
     int ret, flags, i;
     uint32_t bar_val;
 
@@ -692,7 +696,7 @@ static int
 setup_pci_id(vfu_ctx_t *vfu_ctx)
 {
     struct proxy_data *p = vfu_get_private(vfu_ctx);
-    uint64_t cfg_off = p->regions[VFIO_PCI_CONFIG_REGION_INDEX].offset;
+    loff_t cfg_off = p->regions[VFIO_PCI_CONFIG_REGION_INDEX].offset;
     vfu_pci_config_space_t *cs = vfu_pci_get_config_space(vfu_ctx);
     uint16_t vendor_id, device_id, subsys_vid, subsys_id;
     uint8_t class_info[3];
