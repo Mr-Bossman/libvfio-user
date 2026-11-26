@@ -49,7 +49,6 @@
  *
  * Limitations:
  *   - Many PCI capabilities are not reported as they are not copied.
- *   - No DMA support
  *   - No ERR_IRQ or REQ_IRQ support
  *   - No migration state support
  *   - No memory mapping support
@@ -68,6 +67,7 @@
 #include <stdbool.h>
 #include <sys/ioctl.h>
 #include <sys/eventfd.h>
+#include <sys/mman.h>
 #include <linux/vfio.h>
 
 #include "common.h"
@@ -259,6 +259,63 @@ device_reset(vfu_ctx_t *vfu_ctx, vfu_reset_type_t type)
 
     vfu_log(vfu_ctx, LOG_INFO, "device reset successful");
     return 0;
+}
+
+static void
+dma_register(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
+{
+    struct proxy_data *p = vfu_get_private(vfu_ctx);
+    size_t size = info->iova.iov_len;
+    struct vfio_iommu_type1_dma_map dma_map = {
+        .argsz = sizeof(dma_map),
+        .iova = (uintptr_t)info->iova.iov_base,
+        .size = size,
+        .vaddr = (uintptr_t)info->vaddr,
+    };
+
+    if (info->vaddr == NULL) {
+        vfu_log(vfu_ctx, LOG_INFO,
+                "DMA map has no vaddr (iova=%#lx size=%#lx)",
+                (unsigned long)dma_map.iova, (unsigned long)size);
+        return;
+    }
+
+    if (info->prot & PROT_READ) {
+        dma_map.flags |= VFIO_DMA_MAP_FLAG_READ;
+    }
+    if (info->prot & PROT_WRITE) {
+        dma_map.flags |= VFIO_DMA_MAP_FLAG_WRITE;
+    }
+
+    if (ioctl(p->container_fd, VFIO_IOMMU_MAP_DMA, &dma_map) < 0) {
+        vfu_log(vfu_ctx, LOG_ERR,
+                "VFIO_IOMMU_MAP_DMA failed: %m (iova=%#lx size=%#lx vaddr=%#lx)",
+                (unsigned long)dma_map.iova, (unsigned long)size,
+                (unsigned long)dma_map.vaddr);
+        return;
+    }
+
+    vfu_log(vfu_ctx, LOG_INFO,
+            "DMA map iova=%#lx size=%#lx vaddr=%p",
+            (unsigned long)dma_map.iova, (unsigned long)size, info->vaddr);
+}
+
+static void
+dma_unregister(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
+{
+    struct proxy_data *p = vfu_get_private(vfu_ctx);
+    struct vfio_iommu_type1_dma_unmap dma_unmap = {
+        .argsz = sizeof(dma_unmap),
+        .iova = (uintptr_t)info->iova.iov_base,
+        .size = info->iova.iov_len,
+    };
+
+    vfu_log(vfu_ctx, LOG_INFO, "DMA unmap iova=%#lx size=%#lx",
+            (unsigned long)dma_unmap.iova, (unsigned long)dma_unmap.size);
+
+    if (ioctl(p->container_fd, VFIO_IOMMU_UNMAP_DMA, &dma_unmap) < 0) {
+        vfu_log(vfu_ctx, LOG_ERR, "VFIO_IOMMU_UNMAP_DMA failed: %m");
+    }
 }
 
 static void setup_regions(struct proxy_data *p, uint32_t i)
@@ -748,6 +805,13 @@ setup_device(vfu_ctx_t *vfu_ctx, bool no_rom)
     ret = vfu_setup_device_reset_cb(vfu_ctx, &device_reset);
     if (ret < 0) {
         vfu_log(vfu_ctx, LOG_ERR, "vfu_setup_device_reset_cb: %m");
+        return -1;
+    }
+
+    ret = vfu_setup_device_dma(vfu_ctx, LIBVFIO_USER_MAX_DMA_REGIONS,
+                               dma_register, dma_unregister);
+    if (ret < 0) {
+        vfu_log(vfu_ctx, LOG_ERR, "vfu_setup_device_dma: %m");
         return -1;
     }
 
