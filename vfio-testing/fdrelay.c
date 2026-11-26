@@ -968,6 +968,17 @@ main(int argc, char **argv)
             usage();
         }
         unlink(addr.sun_path);
+        {
+            char tmp[sizeof(addr.sun_path)];
+            char *slash;
+
+            strcpy(tmp, addr.sun_path);
+            slash = strrchr(tmp, '/');
+            if (slash) {
+                *slash = '\0';
+                mkdir(tmp, 0755);
+            }
+        }
         if (lfd < 0 || bind(lfd, (void *)&addr, sizeof(addr)) < 0 ||
             listen(lfd, 1) < 0) {
             die("listen");
