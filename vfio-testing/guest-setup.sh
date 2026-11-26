@@ -82,8 +82,9 @@ install_l2_script() {
 cp /run/live/medium/live/vmlinuz /tmp/l2-vmlinuz
 cp /run/live/medium/live/initrd.img /tmp/l2-initrd.img
 exec qemu-system-x86_64 \
-    -machine q35 \
-    -m 2G -enable-kvm -cpu host \
+    -object memory-backend-memfd,id=mem,size=2G,share=on \
+    -machine q35,memory-backend=mem \
+    -enable-kvm -cpu host \
     -kernel /tmp/l2-vmlinuz \
     -initrd /tmp/l2-initrd.img \
     -cdrom /dev/cdrom \
@@ -101,13 +102,13 @@ install_packages
 setup_ssh
 build_libvfio
 
-NE2K_BDF=$(lspci -D -d 10ec:8029 | head -1 | awk '{print $1}')
-if [ -z "$NE2K_BDF" ]; then
-    echo "ERROR: No ne2k_pci device found"
+E1000_BDF=$(lspci -D -d 8086:100e | head -1 | awk '{print $1}')
+if [ -z "$E1000_BDF" ]; then
+    echo "ERROR: No e1000 device found"
     exit 1
 fi
 
-install_proxy_service "$NE2K_BDF"
+install_proxy_service "$E1000_BDF"
 install_l2_script
 
 systemctl disable guest-setup.service

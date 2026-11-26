@@ -1,7 +1,7 @@
 #!/bin/bash
 #
-# Starts an L1 VM (Debian live) with an emulated ne2k_pci NIC and nested KVM.
-# Inside L1, guest-setup.sh builds libvfio-user, binds the ne2000 to vfio-pci,
+# Starts an L1 VM (Debian live) with an emulated e1000 NIC and nested KVM.
+# Inside L1, guest-setup.sh builds libvfio-user, binds the e1000 to vfio-pci,
 # and runs vfio-user-proxy. L2 runs inside L1 using nested virtualization,
 # accessing the proxy socket directly via QEMU's vfio-user-pci.
 #
@@ -160,7 +160,7 @@ start_l1() {
 
     echo "=== Starting L1 VM ==="
     echo ""
-    echo "  ne2k_pci    -> passthrough target (PIO, no DMA)"
+    echo "  e1000       -> passthrough target (MMIO + DMA)"
     echo "  virtio-net  -> network for apt (SSH on host port 2222)"
     echo "  persistence -> autologin + guest-setup + libvfio-user source"
     echo "  attach:       tmux attach -t $TMUX_SESSION"
@@ -175,9 +175,9 @@ start_l1() {
             -initrd '$tmpdir/initrd.img' \
             -cdrom '$ISO' \
             -drive file='$PERSIST_IMG',format=raw,if=virtio \
-            -append 'boot=live console=ttyS0 modprobe.blacklist=ne2k_pci persistence intel_iommu=on' \
+            -append 'boot=live console=ttyS0 modprobe.blacklist=e1000 persistence intel_iommu=on' \
             -device intel-iommu \
-            -netdev user,id=ne2knet -device ne2k_pci,netdev=ne2knet \
+            -netdev user,id=e1knet -device e1000,netdev=e1knet \
             -nic user,model=virtio-net-pci,hostfwd=tcp::2222-:22 \
             -nographic"
 }
