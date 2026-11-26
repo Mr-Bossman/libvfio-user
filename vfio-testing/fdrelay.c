@@ -98,11 +98,13 @@ static unsigned interval_us = 5000;
 static int flush_on_msg = 1;
 static int trap_mode;
 
-/* writer queue */
+/* writer queue: priority (protocol) and bulk (memory diffs) */
 struct qitem { struct qitem *next; size_t len; uint8_t buf[]; };
-static struct qitem *qhead, *qtail;
+static struct qitem *qhead, *qtail;       /* priority: DATA, SIGNAL, etc. */
+static struct qitem *mhead, *mtail;       /* bulk: scanner MEM frames */
 static pthread_mutex_t qlock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t qcond = PTHREAD_COND_INITIALIZER;
+static int bulk_mode;                     /* set by scanner under lock */
 
 static pid_t child = -1;          /* listen mode: the far-end command */
 static const char *listen_path;  /* listen mode: socket file we created */
@@ -230,6 +232,20 @@ queue_put(struct qitem *q)
 }
 
 static void
+queue_put_bulk(struct qitem *q)
+{
+    pthread_mutex_lock(&qlock);
+    if (mtail) {
+        mtail->next = q;
+    } else {
+        mhead = q;
+    }
+    mtail = q;
+    pthread_cond_signal(&qcond);
+    pthread_mutex_unlock(&qlock);
+}
+
+static void
 emit(uint8_t type, const void *a, size_t alen, const void *b, size_t blen)
 {
     uint8_t *p;
@@ -250,13 +266,21 @@ writer_thread(void *arg)
         struct qitem *q;
 
         pthread_mutex_lock(&qlock);
-        while (!qhead) {
+        while (!qhead && !mhead) {
             pthread_cond_wait(&qcond, &qlock);
         }
-        q = qhead;
-        qhead = q->next;
-        if (!qhead) {
-            qtail = NULL;
+        if (qhead) {
+            q = qhead;
+            qhead = q->next;
+            if (!qhead) {
+                qtail = NULL;
+            }
+        } else {
+            q = mhead;
+            mhead = q->next;
+            if (!mhead) {
+                mtail = NULL;
+            }
         }
         busy = 1;
         pthread_mutex_unlock(&qlock);
@@ -456,7 +480,11 @@ emit_run(struct obj *o, size_t a, size_t b)
     if (o->sh) {
         memcpy(o->sh + a, p + 12, b - a);   /* ... shadow matches what we send */
     }
-    queue_put(q);
+    if (bulk_mode) {
+        queue_put_bulk(q);
+    } else {
+        queue_put(q);
+    }
 }
 
 static int
@@ -587,7 +615,9 @@ scanner_thread(void *arg)
     for (;;) {
         usleep(interval_us);
         pthread_mutex_lock(&lock);
+        bulk_mode = 1;
         flush();
+        bulk_mode = 0;
         pthread_mutex_unlock(&lock);
     }
     return NULL;
@@ -620,11 +650,9 @@ watcher_thread(void *arg)
                 continue;
             }
             pthread_mutex_lock(&lock);
-            if (flush_on_msg) {
-                flush();
-            }
-            emit(T_SIGNAL, &s, sizeof(s), NULL, 0);
+            flush();
             pthread_mutex_unlock(&lock);
+            emit(T_SIGNAL, &s, sizeof(s), NULL, 0);
         } else {
             uint8_t buf[65536];
             ssize_t n = read(o->fd, buf, sizeof(buf));
@@ -637,12 +665,12 @@ watcher_thread(void *arg)
                 epoll_ctl(epfd, EPOLL_CTL_DEL, o->fd, NULL);
                 continue;
             }
-            pthread_mutex_lock(&lock);
             if (flush_on_msg) {
+                pthread_mutex_lock(&lock);
                 flush();
+                pthread_mutex_unlock(&lock);
             }
             emit(T_STREAM, &id, 4, buf, n);
-            pthread_mutex_unlock(&lock);
             if (n == 0) {
                 epoll_ctl(epfd, EPOLL_CTL_DEL, o->fd, NULL);
             }
@@ -662,7 +690,7 @@ local_closed(void)
         int idle;
 
         pthread_mutex_lock(&qlock);
-        idle = !qhead && !busy;
+        idle = !qhead && !mhead && !busy;
         pthread_mutex_unlock(&qlock);
         if (idle) {
             break;
@@ -699,24 +727,26 @@ deliver(const uint8_t *p, uint32_t len)
     data = p + off;
     dlen = len - off;
 
-    pthread_mutex_lock(&lock);
-    for (int i = 0; i < nf; i++) {
-        struct obj *o = find(ids[i]);
-        int fd = -1;
+    if (nf > 0) {
+        pthread_mutex_lock(&lock);
+        for (int i = 0; i < nf; i++) {
+            struct obj *o = find(ids[i]);
+            int fd = -1;
 
-        if (o && !o->origin) {
-            if (o->kind == K_STREAM) {
-                fd = o->hand;
-                o->hand = -1;
-            } else {
-                fd = dup(o->fd);
+            if (o && !o->origin) {
+                if (o->kind == K_STREAM) {
+                    fd = o->hand;
+                    o->hand = -1;
+                } else {
+                    fd = dup(o->fd);
+                }
+            }
+            if (fd >= 0) {
+                fds[n++] = fd;
             }
         }
-        if (fd >= 0) {
-            fds[n++] = fd;
-        }
+        pthread_mutex_unlock(&lock);
     }
-    pthread_mutex_unlock(&lock);
 
     iov.iov_base = (void *)data;
     iov.iov_len = dlen;
@@ -886,16 +916,19 @@ local_reader(void)
         if (n < 0) {
             n = 0;
         }
-        pthread_mutex_lock(&lock);
-        for (int i = 0; i < nfds; i++) {
-            uint32_t id = adopt(fds[i]);
+        if (nfds > 0 || flush_on_msg) {
+            pthread_mutex_lock(&lock);
+            for (int i = 0; i < nfds; i++) {
+                uint32_t id = adopt(fds[i]);
 
-            if (id) {
-                ids[nids++] = id;
+                if (id) {
+                    ids[nids++] = id;
+                }
             }
-        }
-        if (flush_on_msg) {
-            flush();
+            if (flush_on_msg) {
+                flush();
+            }
+            pthread_mutex_unlock(&lock);
         }
         {
             uint8_t *p;
@@ -906,7 +939,6 @@ local_reader(void)
             memcpy(p + 2 + 4 * (size_t)nids, buf, n);
             queue_put(q);
         }
-        pthread_mutex_unlock(&lock);
     }
 }
 
